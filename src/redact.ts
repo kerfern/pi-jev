@@ -45,7 +45,7 @@ function basename(value: string): string {
   return parts[parts.length - 1] ?? trimmed;
 }
 
-const DEFAULT_RULES: Rule[] = [
+const BASE_RULES: Rule[] = [
   { name: "private-key", pattern: PRIVATE_KEY, replace: "[redacted private key]" },
   { name: "authorization", pattern: BEARER, replace: "$1 [redacted]" },
   { name: "known-token", pattern: KNOWN_TOKEN, replace: "[redacted token]" },
@@ -53,9 +53,24 @@ const DEFAULT_RULES: Rule[] = [
   { name: "url-credentials", pattern: URL_CREDENTIALS, replace: "$1[redacted]@" },
   { name: "env-assignment", pattern: ENV_ASSIGNMENT, replace: "$1=[redacted]" },
   { name: "email", pattern: EMAIL, replace: "[redacted email]" },
+];
+const PATH_RULES: Rule[] = [
   { name: "posix-path", pattern: POSIX_PATH, replace: (match) => basename(match) },
   { name: "windows-path", pattern: WINDOWS_PATH, replace: (match) => basename(match) },
 ];
+const PREVIEW_PATH_RULES: Rule[] = [
+  {
+    name: "posix-path",
+    pattern: POSIX_PATH,
+    replace: (match) => `[absolute path prefix redacted]/${basename(match)}`,
+  },
+  {
+    name: "windows-path",
+    pattern: WINDOWS_PATH,
+    replace: (match) => `[absolute path prefix redacted]\\${basename(match)}`,
+  },
+];
+const DEFAULT_RULES: Rule[] = [...BASE_RULES, ...PATH_RULES];
 
 const STRICT_RULES: Rule[] = [
   { name: "credit-card", pattern: /\b(?:\d[ -]?){13,19}\b/g, replace: "[redacted card]" },
@@ -68,6 +83,8 @@ export interface RedactorOptions {
   patterns?: RedactionPatterns;
   /** Extra regex sources, already resolved from the config file by config.ts. */
   customPatterns?: string[];
+  /** How absolute paths are handled; defaults to basename redaction. */
+  pathMode?: "basename" | "marked" | "preserve";
 }
 
 function compileCustom(sources: string[]): Rule[] {
@@ -97,7 +114,10 @@ function applyRules(text: string, rules: Rule[]): string {
 export function createRedactor(options: RedactorOptions = {}): RedactFn {
   const strict = options.patterns === "strict";
   const custom = options.customPatterns ?? [];
-  const rules = [...DEFAULT_RULES, ...(strict ? STRICT_RULES : []), ...compileCustom(custom)];
+  let paths = PATH_RULES;
+  if (options.pathMode === "marked") paths = PREVIEW_PATH_RULES;
+  else if (options.pathMode === "preserve") paths = [];
+  const rules = [...BASE_RULES, ...paths, ...(strict ? STRICT_RULES : []), ...compileCustom(custom)];
 
   const redact = ((text: string): string => {
     if (typeof text !== "string" || text.length === 0) return text;

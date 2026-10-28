@@ -9,11 +9,12 @@
  * (initial_plan.md §9.2, 9.6).
  */
 
+import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { effectiveSkipCommands } from "../config.ts";
-import { GATE_QUESTIONS, withRuleQuestions } from "../questions.ts";
+import { GATE_INVESTIGATION_QUESTIONS, GATE_QUESTIONS, withRuleQuestions } from "../questions.ts";
 import type {
   Answer,
   Answers,
@@ -22,9 +23,11 @@ import type {
   Deps,
   GateDecision,
   GateOutcome,
+  GateReadOnlyEvidenceTool,
   GateRulesConfig,
 } from "../types.ts";
-import { formatStatus, sha256Hex } from "../telemetry.ts";
+import { ENFORCEMENT_CANCELLED, combineAbortSignals, raceWithAbort } from "../enforcement.ts";
+import { formatStatus, hashState } from "../telemetry.ts";
 
 export type GateAnswers = Answers<typeof GATE_QUESTIONS>;
 
@@ -76,9 +79,9 @@ export function isSkippedTool(tool: string, skipTools: readonly string[]): boole
 /* -------------------------------------------------------------------------- */
 
 /**
- * Paths and numeric literals are masked so that `git log -5` and `git log -10`
- * share a cache entry. Whitespace is collapsed. This is only a cache key; the
- * gate still classifies the unmodified command.
+ * Normalizes paths and numbers before they are included in the opaque cache
+ * digest. Exact tool input is also included, so changed arguments never share
+ * a cache entry because of normalization.
  */
 export function normaliseCommand(command: string): string {
   return command
@@ -90,15 +93,17 @@ export function normaliseCommand(command: string): string {
 }
 
 /**
- * Disk-cache key for a gate decision. The normalised command groups trivially
- * different spellings, but the exact command, the original request and the
- * repository are hashed in too: `matches_intent` is derived from the request,
- * and numeric arguments change meaning (`chmod 000` vs `chmod 755`), so a key
- * based on the normalised command alone would serve a decision from the wrong
- * context.
+ * Opaque identity for cached gate answers. Hash full tool input plus gate
+ * context and cwd; never persist raw command text.
  */
-export function gateCacheKey(command: string, userRequest: string, cwdBasename: string): string {
-  return `${normaliseCommand(command)}#${sha256Hex(`${cwdBasename}\n${userRequest}\n${command}`)}`;
+export function gateCacheKey(tool: string, input: Record<string, unknown>, state: GateState, cwd: string): string {
+  return hashState({
+    normalizedCommand: normaliseCommand(state.command),
+    tool,
+    input,
+    state,
+    cwd,
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -120,10 +125,51 @@ export interface GateState {
   cwd_basename: string;
   user_request: string;
   recent_commands: string[];
+  /** One bounded, redacted read-only result used for Rule 6 re-evaluation. */
+  investigation_evidence?: {
+    tool: GateReadOnlyEvidenceTool;
+    content: string;
+    truncated: boolean;
+  };
   /** Proposed content for a write/edit, when project rules are being judged. */
   change?: string;
   /** Project rules the change is judged against (indexed to match `rule_N`). */
   project_rules?: Array<{ title: string; body: string; paths?: string[] }>;
+}
+
+export interface GateEvidenceResult {
+  toolCallId: string;
+  toolName: string;
+  isError: boolean;
+  text?: string;
+}
+
+export type GateEvidenceObserver = (result: GateEvidenceResult) => void;
+
+interface PendingInvestigation {
+  actionKey: string;
+  resultConsumed: boolean;
+  candidate?: { toolCallId: string; tool: GateReadOnlyEvidenceTool };
+  evidence?: NonNullable<GateState["investigation_evidence"]>;
+}
+
+const READ_ONLY_EVIDENCE_TOOLS = new Set<GateReadOnlyEvidenceTool>(["read"]);
+const MAX_INVESTIGATION_EVIDENCE_BYTES = 4_096;
+
+function isReadOnlyEvidenceTool(tool: string): tool is GateReadOnlyEvidenceTool {
+  return READ_ONLY_EVIDENCE_TOOLS.has(tool as GateReadOnlyEvidenceTool);
+}
+
+function truncateUtf8(text: string, maxBytes: number): { content: string; truncated: boolean } {
+  let bytes = 0;
+  let end = 0;
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) return { content: text.slice(0, end), truncated: true };
+    bytes += characterBytes;
+    end += character.length;
+  }
+  return { content: text, truncated: false };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -219,7 +265,12 @@ export function decideGate(answers: GateAnswers, config: Config): GateDecision {
  */
 export function enforceBlockPolicy(decision: GateDecision, allowBlock: boolean): GateDecision {
   if (decision.outcome === "block" && !allowBlock) {
-    return { ...decision, outcome: "confirm", reason: `${decision.reason} [block disabled → confirm]` };
+    return {
+      ...decision,
+      outcome: "confirm",
+      blockDowngraded: true,
+      reason: `${decision.reason} [block disabled → confirm]`,
+    };
   }
   return decision;
 }
@@ -234,7 +285,7 @@ interface FastPathPattern {
   reason: string;
 }
 
-/** Unambiguously destructive: decided as block (or confirm when `block` is off). */
+/** Unambiguously destructive: block, or mandatory confirm when `block` is off. */
 const FAST_PATH_BLOCK: readonly FastPathPattern[] = [
   { pattern: /\brm\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*[rR][A-Za-z]*[fF][A-Za-z]*\s+\/(?:\s|$|\*)/, reason: "recursive delete of the filesystem root" },
   { pattern: /\bdd\b[^\n]*\bof=\/dev\/(?:disk|sd|nvme|rdisk)/, reason: "raw write to a block device" },
@@ -257,12 +308,19 @@ const FAST_PATH_CONFIRM: readonly FastPathPattern[] = [
 
 /**
  * Decides obvious commands in code, before any network call. `block` decides
- * whether an unambiguously destructive pattern blocks or (when `allowBlock` is
- * off) degrades to confirm.
+ * whether an unambiguously destructive pattern blocks or degrades to a
+ * confirmation that cannot be steered away.
  */
-export function matchFastPath(command: string, block: boolean): { outcome: GateOutcome; reason: string } | undefined {
+export function matchFastPath(
+  command: string,
+  block: boolean,
+): { outcome: GateOutcome; reason: string; blockDowngraded?: true } | undefined {
   for (const entry of FAST_PATH_BLOCK) {
-    if (entry.pattern.test(command)) return { outcome: block ? "block" : "confirm", reason: `pattern: ${entry.reason}` };
+    if (entry.pattern.test(command)) {
+      return block
+        ? { outcome: "block", reason: `pattern: ${entry.reason}` }
+        : { outcome: "confirm", blockDowngraded: true, reason: `pattern: ${entry.reason}` };
+    }
   }
   for (const entry of FAST_PATH_CONFIRM) {
     if (entry.pattern.test(command)) return { outcome: "confirm", reason: `pattern: ${entry.reason}` };
@@ -391,6 +449,7 @@ export function escalateForRules(
     rule: 0,
     branch: "rules",
     steer: config.onViolation === "steer",
+    ...(decision.blockDowngraded ? { blockDowngraded: true } : {}),
     reason,
     numbers,
   };
@@ -400,14 +459,32 @@ export function escalateForRules(
 /* Hook                                                                       */
 /* -------------------------------------------------------------------------- */
 
-export function register(pi: ExtensionAPI, deps: Deps): void {
+export function register(pi: ExtensionAPI, deps: Deps): GateEvidenceObserver {
   let userRequest = "";
   const recentCommands: string[] = [];
   let rules: ParsedRule[] = [];
+  let investigationUsed = false;
+  let investigationActionKey: string | undefined;
+  let investigationDecision: GateDecision | undefined;
+  let investigationRecheckDecision: GateDecision | undefined;
+  let investigationRecheckInFlight = false;
+  let pendingInvestigation: PendingInvestigation | undefined;
+
+  const resetInvestigation = () => {
+    investigationUsed = false;
+    investigationActionKey = undefined;
+    investigationDecision = undefined;
+    investigationRecheckDecision = undefined;
+    investigationRecheckInFlight = false;
+    pendingInvestigation = undefined;
+  };
 
   pi.on("session_start", (_event, ctx) => {
+    resetInvestigation();
     rules = deps.config.modules.gate.rules.enabled ? loadRules(ctx.cwd, deps.config.modules.gate.rules) : [];
   });
+
+  pi.on("agent_settled", resetInvestigation);
 
   pi.on("before_agent_start", (event) => {
     userRequest = event.prompt;
@@ -415,15 +492,56 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
 
   pi.on("tool_call", async (event, ctx) => {
     if (!deps.config.modules.gate.enabled || !deps.state.layerEnabled) return;
+    const scope = deps.enforcement.callScope(event.toolCallId) ?? deps.enforcement.capture();
+    if (!deps.enforcement.isCurrent(scope)) return;
     const tool = event.toolName;
     const config = deps.config.modules.gate;
-    if (isSkippedTool(tool, config.skipTools)) return;
+    const shadow = deps.state.shadow.gate;
+    const pilotEnabled = config.lowConfidenceMode === "investigate-once" && !shadow;
+    if (isSkippedTool(tool, config.skipTools)) {
+      if (
+        pilotEnabled &&
+        pendingInvestigation &&
+        !pendingInvestigation.resultConsumed &&
+        !pendingInvestigation.candidate &&
+        !pendingInvestigation.evidence &&
+        isReadOnlyEvidenceTool(tool)
+      ) {
+        pendingInvestigation.candidate = { toolCallId: event.toolCallId, tool };
+      }
+      return;
+    }
 
     const input = event.input as Record<string, unknown>;
     const command = describeToolInput(tool, input);
     if (typeof input.command === "string" && isSkippedCommand(input.command, effectiveSkipCommands(config))) {
       return;
     }
+
+    const actionKey = hashState({
+      session: deps.state.sessionId ?? "",
+      request: userRequest,
+      cwd: ctx.cwd,
+      tool,
+      input,
+    });
+    let evidenceForRecheck: GateState["investigation_evidence"];
+    let rechecking = false;
+    let duplicateRecheck = false;
+    let missingEvidence = false;
+    if (!pilotEnabled) pendingInvestigation = undefined;
+    if (pilotEnabled && investigationUsed && actionKey === investigationActionKey) {
+      if (investigationRecheckInFlight) {
+        duplicateRecheck = true;
+      } else if (pendingInvestigation?.actionKey === actionKey && pendingInvestigation.evidence) {
+        evidenceForRecheck = pendingInvestigation.evidence;
+        rechecking = true;
+        investigationRecheckInFlight = true;
+      } else {
+        missingEvidence = true;
+      }
+    }
+    pendingInvestigation = undefined;
 
     const applicableRules = config.rules.enabled ? rulesForTool(rules, input) : [];
     const state: GateState = {
@@ -433,6 +551,7 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
       user_request: userRequest,
       recent_commands: [...recentCommands],
     };
+    if (evidenceForRecheck) state.investigation_evidence = evidenceForRecheck;
     if (applicableRules.length > 0) {
       state.change = describeChange(input);
       state.project_rules = applicableRules.map((rule) => ({
@@ -451,61 +570,143 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
     let computed: GateDecision;
     let meta: AskMeta | undefined;
     let answers: Record<string, Answer | undefined> | undefined;
+    let forceRule6Ask = false;
+    let forceInvestigationBlock = false;
 
-    if (fast) {
+    if (duplicateRecheck && investigationDecision) {
+      computed = {
+        ...investigationDecision,
+        outcome: "block",
+        reason: "low-confidence Rule 6 re-evaluation is already in progress",
+      };
+    } else if (missingEvidence && investigationDecision) {
+      if (investigationRecheckDecision?.outcome === "block") {
+        computed = investigationRecheckDecision;
+      } else {
+        computed = {
+          ...investigationDecision,
+          outcome: "confirm",
+          reason: "low-confidence Rule 6 remains unresolved: no usable read-only evidence",
+        };
+        forceRule6Ask = true;
+      }
+    } else if (fast) {
       computed = enforceBlockPolicy(
-        { outcome: fast.outcome, rule: 0, branch: "fastpath", reason: fast.reason, numbers: {} },
+        {
+          outcome: fast.outcome,
+          rule: 0,
+          branch: "fastpath",
+          ...(fast.blockDowngraded ? { blockDowngraded: true } : {}),
+          reason: fast.reason,
+          numbers: {},
+        },
         config.allowBlock,
       );
     } else {
+      const gateQuestions = evidenceForRecheck ? GATE_INVESTIGATION_QUESTIONS : GATE_QUESTIONS;
       const questions = withRuleQuestions(
-        GATE_QUESTIONS,
+        gateQuestions,
         applicableRules.map((_rule, index) => ({ key: `rule_${index}`, index })),
       );
       const result = await deps.ask("gate", state, questions, {
         signal: ctx.signal,
-        cacheKey: gateCacheKey(command, userRequest, basename(ctx.cwd)),
+        scope,
+        cacheKey: gateCacheKey(tool, input, state, ctx.cwd),
       });
-      if (!result) return failOpen(deps, tool, command);
-      meta = result.meta;
-      answers = result.answers as Record<string, Answer | undefined>;
-      computed = enforceBlockPolicy(
-        decideGate(result.answers as unknown as GateAnswers, deps.config),
-        config.allowBlock,
-      );
-      if (applicableRules.length > 0) {
-        computed = escalateForRules(
-          computed,
-          evaluateRuleViolations(answers, applicableRules, config.rules),
-          config.rules,
+      if (result === ENFORCEMENT_CANCELLED || !deps.enforcement.isCurrent(scope)) {
+        if (rechecking) investigationRecheckInFlight = false;
+        return;
+      }
+      if (!result) {
+        if (rechecking && investigationDecision) {
+          computed = {
+            ...investigationDecision,
+            outcome: "confirm",
+            reason: "low-confidence Rule 6 remains unresolved: re-evaluation unavailable",
+          };
+          forceRule6Ask = true;
+        } else {
+          return failOpen(deps, tool, command);
+        }
+      } else {
+        meta = result.meta;
+        answers = result.answers as Record<string, Answer | undefined>;
+        computed = enforceBlockPolicy(
+          decideGate(result.answers as unknown as GateAnswers, deps.config),
+          config.allowBlock,
         );
+        if (applicableRules.length > 0) {
+          computed = escalateForRules(
+            computed,
+            evaluateRuleViolations(answers, applicableRules, config.rules),
+            config.rules,
+          );
+        }
       }
     }
+    if (rechecking) {
+      investigationRecheckInFlight = false;
+      investigationRecheckDecision = computed;
+    }
 
-    const shadow = deps.state.shadow.gate;
+    if (pilotEnabled && !investigationUsed && computed.outcome === "confirm" && computed.rule === 6) {
+      investigationUsed = true;
+      investigationActionKey = actionKey;
+      investigationDecision = computed;
+      pendingInvestigation = { actionKey, resultConsumed: false };
+      forceInvestigationBlock = true;
+    } else if (pilotEnabled && investigationUsed && computed.outcome === "confirm" && computed.rule === 6) {
+      forceRule6Ask = true;
+    }
+
     let enforced: GateOutcome | "steer" = shadow ? "allow" : computed.outcome;
     let userChoice: "allow" | "deny" | "unknown" | undefined;
     let blockReason: string | undefined;
     let steerReason: string | undefined;
 
-    if (!shadow && computed.steer) {
+    if (!shadow && forceInvestigationBlock) {
+      enforced = "block";
+      blockReason = "low-confidence Rule 6; inspect with one read-only tool, then retry this exact action once";
+    } else if (!shadow && computed.steer && !computed.blockDowngraded) {
       enforced = "steer";
       steerReason = computed.reason;
     } else if (!shadow && computed.outcome === "confirm") {
-      if (config.confirmMode === "steer") {
+      if (config.confirmMode === "steer" && !computed.blockDowngraded && !forceRule6Ask) {
         enforced = "steer";
         steerReason = computed.reason;
-      } else if (ctx.hasUI) {
-        const ok = await ctx.ui.confirm("Jev: confirm", confirmMessage(computed, command));
+      } else if (ctx.hasUI && !(forceRule6Ask && ctx.signal?.aborted)) {
+        const redactPreview = ctx.mode === "tui" ? deps.redactLocalPreview : deps.redactPreview;
+        const preview =
+          typeof input.command === "string"
+            ? `${tool}\n${redactPreview(input.command)}`
+            : `${tool}\n${JSON.stringify(redactPreview.deep(input), null, 2)}`;
+        const displayPreview =
+          ctx.mode === "tui"
+            ? preview.replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, (character) =>
+                `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+              )
+            : preview;
+        const confirmSignal = combineAbortSignals(ctx.signal, scope.signal);
+        const confirmed = await raceWithAbort(
+          ctx.ui.confirm("Jev: confirm", confirmMessage(computed, displayPreview), { signal: confirmSignal }),
+          confirmSignal,
+        );
+        if (confirmed === ENFORCEMENT_CANCELLED || !deps.enforcement.isCurrent(scope)) {
+          if (rechecking) investigationRecheckInFlight = false;
+          return;
+        }
+        const ok = confirmed;
         userChoice = ok ? "allow" : "deny";
         enforced = ok ? "allow" : "block";
         if (!ok) blockReason = `blocked by user: ${computed.reason}`;
       } else {
         // print/json mode: no prompts (initial_plan.md §14, mode behaviour).
         userChoice = "unknown";
-        if (config.withoutUi === "deny") {
+        if (forceRule6Ask || config.withoutUi === "deny") {
           enforced = "block";
-          blockReason = `no UI to confirm: ${computed.reason}`;
+          blockReason = ctx.signal?.aborted
+            ? `re-evaluation interrupted: ${computed.reason}`
+            : `no UI to confirm: ${computed.reason}`;
         } else {
           enforced = "allow";
         }
@@ -518,7 +719,8 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
       hook: "gate" as const,
       questionsVersion: "",
       stateHash: meta?.stateHash ?? "",
-      state: meta?.redactedState,
+      // Evidence is sent to Jev for re-evaluation but never persisted in gate logs.
+      state: evidenceForRecheck ? undefined : meta?.redactedState,
       tool,
       answers,
       decision: enforced,
@@ -558,9 +760,41 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
         { deliverAs: "steer" },
       );
     }
-    if (blockReason) return { block: true, reason: `Jev: ${blockReason}` };
+    if (blockReason) {
+      deps.enforcement.releaseCall(event.toolCallId);
+      return { block: true, reason: `Jev: ${blockReason}` };
+    }
     return;
   });
+
+  return (result) => {
+    const pending = pendingInvestigation;
+    const candidate = pending?.candidate;
+    if (!pending || !candidate || candidate.toolCallId !== result.toolCallId || candidate.tool !== result.toolName) {
+      return;
+    }
+    delete pending.candidate;
+    pending.resultConsumed = true;
+    if (
+      deps.config.modules.gate.lowConfidenceMode !== "investigate-once" ||
+      deps.state.shadow.gate ||
+      !deps.state.layerEnabled ||
+      result.isError ||
+      typeof result.text !== "string"
+    ) {
+      return;
+    }
+    let redacted: string;
+    try {
+      redacted = deps.redact(result.text);
+    } catch {
+      return;
+    }
+    if (redacted.trim().length === 0) return;
+    const bounded = truncateUtf8(redacted, MAX_INVESTIGATION_EVIDENCE_BYTES);
+    if (bounded.content.trim().length === 0) return;
+    pending.evidence = { tool: candidate.tool, content: bounded.content, truncated: bounded.truncated };
+  };
 }
 
 function failOpen(deps: Deps, tool: string, command: string): { block: true; reason: string } | void {
@@ -583,9 +817,15 @@ function failOpen(deps: Deps, tool: string, command: string): { block: true; rea
   return;
 }
 
-/** The auditable prompt: the reason and the driving number (initial_plan.md §9.5). */
-export function confirmMessage(decision: GateDecision, command: string): string {
-  return `${decision.reason}\n  ${command.split("\n")[0]}\nAllow?`;
+const MAX_CONFIRM_PREVIEW_CHARS = 2_000;
+
+/** The auditable prompt: decision reason and bounded action preview. */
+export function confirmMessage(decision: GateDecision, preview: string): string {
+  const visiblePreview =
+    preview.length > MAX_CONFIRM_PREVIEW_CHARS
+      ? `${preview.slice(0, MAX_CONFIRM_PREVIEW_CHARS)}\n[preview truncated after ${MAX_CONFIRM_PREVIEW_CHARS} characters]`
+      : preview;
+  return `${decision.reason}\nAction preview (redacted):\n${visiblePreview}\nAllow?`;
 }
 
 function basename(path: string): string {

@@ -15,6 +15,7 @@ import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { WATCHDOG_QUESTIONS } from "../questions.ts";
 import type { Answers, Config, Deps, WatchdogDecision } from "../types.ts";
+import { ENFORCEMENT_CANCELLED } from "../enforcement.ts";
 import { summariseTurn, messageText, type SummarisedTurn } from "../messages.ts";
 import { formatStatus } from "../telemetry.ts";
 
@@ -157,7 +158,9 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
       evidence,
     };
 
-    const result = await deps.ask("watchdog", state, WATCHDOG_QUESTIONS, { signal: ctx.signal });
+    const scope = deps.enforcement.capture();
+    const result = await deps.ask("watchdog", state, WATCHDOG_QUESTIONS, { signal: ctx.signal, scope });
+    if (result === ENFORCEMENT_CANCELLED || !deps.enforcement.isCurrent(scope)) return;
     if (!result) {
       deps.log({
         hook: "watchdog",

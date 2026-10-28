@@ -10,6 +10,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createRedactor } from "../src/redact.ts";
 import { defaultConfig, deepMerge } from "../src/config.ts";
+import { EnforcementEpoch } from "../src/enforcement.ts";
 import type {
   Answer,
   ChoiceAnswer,
@@ -60,9 +61,12 @@ export function makeDeps(overrides: Partial<Deps> = {}): RecordingDeps {
   const statuses: (string | undefined)[] = [];
   const deps: Deps = {
     config: makeConfig(),
+    enforcement: new EnforcementEpoch(),
     ask: async () => null,
     log: (record) => records.push(record),
     redact: identityRedact(),
+    redactPreview: createRedactor({ pathMode: "marked" }),
+    redactLocalPreview: createRedactor({ pathMode: "preserve" }),
     state: makeState(),
     status: (text) => statuses.push(text),
     appendEntry: (record) => entries.push(record),

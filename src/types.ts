@@ -5,6 +5,8 @@
  * that modules and tools can be unit-tested without a running harness.
  */
 
+import type { EnforcementCancelled, EnforcementEpoch, EnforcementScope } from "./enforcement.ts";
+
 /* -------------------------------------------------------------------------- */
 /* Jev primitives                                                             */
 /* -------------------------------------------------------------------------- */
@@ -109,6 +111,7 @@ export interface AskResult<A> {
 
 export interface AskOptions {
   signal?: AbortSignal;
+  scope?: EnforcementScope;
   /**
    * Stable key for the gate's on-disk command cache. When present and the hook
    * is `gate`, the client uses the disk cache in addition to the in-memory LRU.
@@ -119,16 +122,19 @@ export interface AskOptions {
 }
 
 /**
- * The only way modules talk to TypeSafe. Returns `null` on every failure path
+ * The only way modules talk to Jev. Returns `null` on every failure path
  * (timeout, HTTP error, budget breach, missing key, disabled layer). The client
  * never throws into a hook handler.
  */
-export type AskFn = <Q extends QuestionSet>(
+export type AskFn = <
+  Q extends QuestionSet,
+  O extends AskOptions | undefined = undefined,
+>(
   hook: HookName,
   state: unknown,
   questions: Q,
-  opts?: AskOptions,
-) => Promise<AskResult<Answers<Q>> | null>;
+  opts?: O,
+) => Promise<AskResult<Answers<Q>> | null | (O extends { scope: EnforcementScope } ? EnforcementCancelled : never)>;
 
 /** Deterministic, pattern-based scrub applied before anything leaves the machine. */
 export interface RedactFn {
@@ -177,6 +183,8 @@ export interface GateDecision {
   branch?: string;
   /** Deliver the concern to the agent instead of prompting the user. */
   steer?: boolean;
+  /** Preserve confirmation when a block is downgraded by policy or fast-path config. */
+  blockDowngraded?: true;
   reason: string;
   numbers: Record<string, number>;
 }
@@ -277,6 +285,8 @@ export type GateFailurePolicy = "allow" | "deny";
 export type ConfirmPolicy = "deny" | "allow-with-log";
 /** `ask` prompts the user; `steer` sends the concern back to the agent instead. */
 export type GateConfirmMode = "ask" | "steer";
+export type GateLowConfidenceMode = "ask" | "investigate-once";
+export type GateReadOnlyEvidenceTool = "read";
 /** What to do when a project rule is judged violated on a write/edit. */
 export type RuleViolationAction = "steer" | "confirm" | "block";
 
@@ -312,6 +322,8 @@ export interface GateConfig {
   withoutUi: ConfirmPolicy;
   /** How a live `confirm` outcome is delivered. */
   confirmMode: GateConfirmMode;
+  /** Project-local Rule 6 investigation pilot; default `ask`. */
+  lowConfidenceMode: GateLowConfidenceMode;
   /** Deterministic pre-filter for obvious commands, independent of Jev. */
   fastPath: GateFastPathConfig;
   /** Semantic lint of writes/edits against project rules. */
@@ -403,6 +415,7 @@ export interface TelemetryConfig {
 }
 
 export interface Config {
+  apiKeyProvider: "typesafe" | "openrouter";
   apiKeyEnv: string;
   model: string;
   /** Override for a self-hosted proxy (initial_plan.md §15.4). */
@@ -472,9 +485,12 @@ export type TelemetryFn = (record: TelemetryRecord) => void;
 /** Dependencies handed to every module's `register(pi, deps)`. */
 export interface Deps {
   config: Config;
+  enforcement: EnforcementEpoch;
   ask: AskFn;
   log: TelemetryFn;
   redact: RedactFn;
+  redactPreview: RedactFn;
+  redactLocalPreview: RedactFn;
   state: SessionState;
   /** Writes the `jev` status line. Bound to the current UI context by index.ts. */
   status(text: string | undefined): void;

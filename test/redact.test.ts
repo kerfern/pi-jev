@@ -39,6 +39,40 @@ describe("redact.ts", () => {
     expect(redact("read /Users/alice/IdeaProjects/secret-project/src/index.ts")).not.toContain("alice");
   });
 
+  it("labels removed absolute path prefixes in preview mode", () => {
+    const previewRedact = createRedactor({ pathMode: "marked" });
+    const token = "ghp_012345678901234567890123456789";
+    expect(previewRedact("rm -rf /tmp/data")).toBe(
+      "rm -rf [absolute path prefix redacted]/data",
+    );
+    const preview = previewRedact.deep({ path: "/tmp/data", content: token }) as {
+      path: string;
+      content: string;
+    };
+    expect(preview.path).toBe("[absolute path prefix redacted]/data");
+    expect(preview.content).toBe("[redacted token]");
+  });
+
+  it("preserves exact paths in preserve mode while redacting secrets", () => {
+    const localPreview = createRedactor({
+      pathMode: "preserve",
+      customPatterns: ["PROJECT-[0-9]{4}"],
+    });
+    const token = "ghp_012345678901234567890123456789";
+    const windowsPath = String.raw`C:\Users\alice\project\file.ts`;
+    expect(localPreview("rm -rf /tmp/data")).toBe("rm -rf /tmp/data");
+    const preview = localPreview.deep({
+      path: "/Users/alice/project/file.ts",
+      windowsPath,
+      content: token,
+      custom: "PROJECT-1234",
+    }) as { path: string; windowsPath: string; content: string; custom: string };
+    expect(preview.path).toBe("/Users/alice/project/file.ts");
+    expect(preview.windowsPath).toBe(windowsPath);
+    expect(preview.content).toBe("[redacted token]");
+    expect(preview.custom).toBe("[redacted]");
+  });
+
   it("adds strict rules only in strict mode", () => {
     const strict = createRedactor({ patterns: "strict" });
     expect(redact("card 4111 1111 1111 1111")).toContain("4111");

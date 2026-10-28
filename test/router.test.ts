@@ -12,6 +12,7 @@ import {
   resolveChosenModel,
   resolveChosenSkill,
   restrictToAllowed,
+  readOnlyToolsFrom,
   thinkingFor,
   type ModelInfo,
   type RouterAnswers,
@@ -123,6 +124,11 @@ describe("router decision", () => {
 });
 
 describe("router helpers", () => {
+  it("intersects read-only routing with Pi's active tools", () => {
+    expect(readOnlyToolsFrom(["read", "write", "edit", "bash", "powershell"])).toEqual(["read", "bash"]);
+    expect(readOnlyToolsFrom([])).toEqual([]);
+  });
+
   it("orders thinking bands", () => {
     const bands = [
       { max: 1, level: "off" as const },

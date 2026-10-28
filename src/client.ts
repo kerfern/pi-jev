@@ -1,5 +1,5 @@
 /**
- * client.ts — the only file that talks to TypeSafe.
+ * client.ts — the only file that talks to Jev.
  *
  * Everything else receives `ask` through `Deps`. A `null` return is the single
  * failure signal; modules branch on it once into their fail-open path. The
@@ -29,6 +29,7 @@ import type {
   TokenUsage,
 } from "./types.ts";
 import { timeouts } from "./config.ts";
+import { ENFORCEMENT_CANCELLED, combineAbortSignals, raceWithAbort } from "./enforcement.ts";
 
 export interface ClientDeps {
   config: Config;
@@ -312,7 +313,7 @@ export function createClient(deps: ClientDeps): Client {
     stateForRequest: unknown,
     questions: QuestionSet,
     signal: AbortSignal | undefined,
-  ): Promise<{ answers: Record<string, Answer>; usage: TokenUsage; latencyMs: number; answeredModel?: string }> {
+  ): Promise<{ answers: Record<string, Answer>; usage: TokenUsage; latencyMs: number; answeredModel?: string } | typeof ENFORCEMENT_CANCELLED> {
     const started = now();
     const controller = new AbortController();
     let timedOut = false;
@@ -335,6 +336,7 @@ export function createClient(deps: ClientDeps): Client {
 
     try {
       for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (signal?.aborted) return ENFORCEMENT_CANCELLED;
         let response: Response;
         try {
           response = await doFetch(url, {
@@ -357,6 +359,7 @@ export function createClient(deps: ClientDeps): Client {
           wrapped.kind = "network";
           throw wrapped;
         }
+        if (signal?.aborted) return ENFORCEMENT_CANCELLED;
 
         if (response.status === 429 || response.status === 529) {
           const retryAfter = Number(response.headers.get("retry-after")) * 1000;
@@ -374,6 +377,7 @@ export function createClient(deps: ClientDeps): Client {
 
         if (!response.ok) {
           const text = await response.text().catch(() => "");
+          if (signal?.aborted) return ENFORCEMENT_CANCELLED;
           const wrapped = new Error(`http ${response.status}`) as Error & {
             kind: string;
             status: number;
@@ -390,6 +394,7 @@ export function createClient(deps: ClientDeps): Client {
           usage?: TokenUsage;
           model?: string;
         };
+        if (signal?.aborted) return ENFORCEMENT_CANCELLED;
         const answers = parseAnswers(questions, parsed);
         const answeredModel = typeof parsed.model === "string" ? parsed.model : undefined;
         return { answers, usage: extractUsage(parsed), latencyMs: now() - started, answeredModel };
@@ -434,11 +439,12 @@ export function createClient(deps: ClientDeps): Client {
     rawState: unknown,
     questions: Q,
     opts: AskOptions = {},
-  ): Promise<{ answers: Answers<Q>; meta: ReturnType<typeof makeMeta> } | null> => {
+  ): Promise<{ answers: Answers<Q>; meta: ReturnType<typeof makeMeta> } | null | typeof ENFORCEMENT_CANCELLED> => {
+    const signal = combineAbortSignals(opts.signal, opts.scope?.signal);
+    if (signal?.aborted) return opts.scope ? ENFORCEMENT_CANCELLED : null;
     if (!state.layerEnabled) return null;
     if (disabledReason) return null;
     if (state.disabledHooks.has(hook)) return null;
-    if (opts.signal?.aborted) return null;
     breachBudget();
     if (disabledReason) return null;
 
@@ -448,7 +454,7 @@ export function createClient(deps: ClientDeps): Client {
 
     const stateHash = hashState(redacted);
     const memKey = `${hook}:${QUESTIONS_VERSION}:${sha256Hex(
-      canonicalJson({ state: redacted, questions }),
+      canonicalJson({ state: redacted, questions, cacheKey: opts.cacheKey ?? null, generation: opts.scope?.generation ?? null }),
     )}`;
 
     if (opts.allowCache !== false) {
@@ -465,13 +471,25 @@ export function createClient(deps: ClientDeps): Client {
     const existing = inflight.get(memKey);
     if (existing) {
       debug.inflightCoalesced += 1;
-      return (await existing) as { answers: Answers<Q>; meta: ReturnType<typeof makeMeta> } | null;
+      const shared = await raceWithAbort(
+        existing as Promise<{ answers: Answers<Q>; meta: ReturnType<typeof makeMeta> } | null>,
+        signal,
+      );
+      return shared === ENFORCEMENT_CANCELLED && !opts.scope ? null : shared;
     }
 
-    // On-disk command cache, gate only (initial_plan.md §6.3).
+    // Cache gate answers only; the decision table and any required confirmation run after each hit.
+    // Hash the complete identity so raw actions and cacheKey text never persist in disk keys.
     let diskKey: string | undefined;
     if (hook === "gate" && config.modules.gate.diskCache && opts.cacheKey) {
-      diskKey = `gate:${opts.cacheKey}`;
+      diskKey = `gate:${hashState({
+        endpoint: config.baseUrl.replace(/\/$/, ""),
+        model: config.model,
+        questionsVersion: QUESTIONS_VERSION,
+        stateHash,
+        generation: opts.scope?.generation ?? null,
+        actionKey: opts.cacheKey,
+      })}`;
       const entry = loadDisk().entries[diskKey];
       if (entry) {
         debug.diskHits += 1;
@@ -485,7 +503,8 @@ export function createClient(deps: ClientDeps): Client {
 
     const task = (async () => {
       try {
-        const result = await performRequest(hook, redacted, questions, opts.signal);
+        const result = await performRequest(hook, redacted, questions, signal);
+        if (result === ENFORCEMENT_CANCELLED || signal?.aborted) return ENFORCEMENT_CANCELLED;
         strikes.delete(hook);
         state.degraded = false;
         state.requests += 1;
@@ -534,17 +553,19 @@ export function createClient(deps: ClientDeps): Client {
           updateStatus();
           return null;
         }
-        if (opts.signal?.aborted) return null;
+        if (signal?.aborted) return ENFORCEMENT_CANCELLED;
         return recordFailure(hook, err.kind === "timeout" ? "timeout" : err.message);
       }
     })();
 
     inflight.set(memKey, task);
     try {
-      return (await task) as { answers: Answers<Q>; meta: ReturnType<typeof makeMeta> } | null;
+      const result = await raceWithAbort(task, signal);
+      return result === ENFORCEMENT_CANCELLED && !opts.scope ? null : result;
     } finally {
-      inflight.delete(memKey);
+      if (inflight.get(memKey) === task) inflight.delete(memKey);
     }
+  // SAFETY: early, in-flight, and task paths expose cancellation only to scoped callers; unscoped calls map it to null.
   }) as unknown as AskFn;
 
   function makeMeta(input: {

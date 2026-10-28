@@ -12,10 +12,11 @@
  */
 
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 
 const port = Number(process.env.MOCK_MODEL_PORT ?? 8899);
 const scriptPath = process.env.MOCK_SCRIPT;
+const requestLogPath = process.env.MOCK_REQUEST_LOG;
 
 function loadScript() {
   if (!scriptPath) return [{ text: "Hello from the mock model." }];
@@ -46,6 +47,22 @@ const server = createServer((req, res) => {
       /* ignore */
     }
     const messages = Array.isArray(body.messages) ? body.messages : [];
+    if (requestLogPath) {
+      const userText = messages
+        .filter((message) => message.role === "user")
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : Array.isArray(message.content)
+              ? message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")
+              : "",
+        )
+        .join("\n");
+      const tools = Array.isArray(body.tools)
+        ? body.tools.map((tool) => tool.function?.name ?? tool.name).filter(Boolean)
+        : [];
+      appendFileSync(requestLogPath, `${JSON.stringify({ userText, tools })}\n`);
+    }
     const script = loadScript();
     // If the script ran out, repeat the last step.
     const step = script[Math.min(stepIndex, script.length - 1)] ?? { text: "done" };

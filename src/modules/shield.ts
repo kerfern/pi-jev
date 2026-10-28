@@ -110,13 +110,14 @@ export function sampleToolOutput(
   return { text, totalLines: total, droppedLines: dropped };
 }
 
-/** Joins the text content of a tool result for classification. */
-export function resultText(content: readonly unknown[], maxChars = 120_000): string {
+/** Joins tool-result text, capped for classification unless maxChars is null. */
+export function resultText(content: readonly unknown[], maxChars: number | null = 120_000): string {
   const parts: string[] = [];
   for (const block of content) {
     if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
       parts.push((block as { text?: string }).text ?? "");
     }
   }
-  return parts.join("\n").slice(0, maxChars);
+  const text = parts.join("\n");
+  return maxChars === null ? text : text.slice(0, maxChars);
 }

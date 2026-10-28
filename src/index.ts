@@ -12,7 +12,7 @@
  * true at the same time.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { defaultConfig, loadConfig, resolveCustomPatterns, ConfigError } from "./config.ts";
 import { createRedactor } from "./redact.ts";
@@ -21,18 +21,23 @@ import {
   createTelemetry,
   formatExplain,
   formatStatus,
+  hashState,
   readLog,
+  sha256Hex,
   summarise,
 } from "./telemetry.ts";
 import { QUESTIONS_VERSION, SHIELD_PRUNE_QUESTIONS } from "./questions.ts";
 import type { AskFn, Config, Deps, ModuleName, RedactFn, SessionState, TelemetryRecord } from "./types.ts";
+import { ENFORCEMENT_CANCELLED, EnforcementEpoch } from "./enforcement.ts";
 import * as router from "./modules/router.ts";
 import * as gate from "./modules/gate.ts";
 import * as shield from "./modules/shield.ts";
 import * as prune from "./modules/prune.ts";
 import * as watchdog from "./modules/watchdog.ts";
+import * as protectedPaths from "./protected-paths.ts";
 
 const MODULES: ModuleName[] = ["router", "gate", "shield", "prune", "watchdog"];
+const MAX_FAILURE_ADVISORIES = 64;
 
 const identityRedact = ((text: string) => text) as RedactFn;
 identityRedact.deep = (value) => value;
@@ -61,6 +66,8 @@ export function isRepoAllowed(cwd: string, allowed: readonly string[]): boolean 
 }
 
 export default function piJev(pi: ExtensionAPI): void {
+  const enforcement = new EnforcementEpoch();
+
   // Register a "typesafe" provider so `pi /login typesafe` can store the Jev
   // key in Pi's auth store (masked prompt) instead of requiring an env var.
   // The env var still wins when present; the stored key is the fallback.
@@ -86,7 +93,11 @@ export default function piJev(pi: ExtensionAPI): void {
   let telemetry: ReturnType<typeof createTelemetry> | undefined;
   let client: ReturnType<typeof createClient> | undefined;
   let redactor: RedactFn = identityRedact;
+  let previewRedactor: RedactFn = identityRedact;
+  let localPreviewRedactor: RedactFn = identityRedact;
   let currentCtx: ExtensionContext | undefined;
+  // Fail-open startup/config states keep the guard; only /jev off disables it.
+  let protectedPathsEnabled = true;
   let configured = false;
 
   const MAX_TRACE = 8;
@@ -104,11 +115,18 @@ export default function piJev(pi: ExtensionAPI): void {
     client ? client.ask(hook, rawState, questions, opts) : Promise.resolve(null);
 
   const deps: Deps = {
+    enforcement,
     get config() {
       return config;
     },
     get redact() {
       return redactor;
+    },
+    get redactPreview() {
+      return previewRedactor;
+    },
+    get redactLocalPreview() {
+      return localPreviewRedactor;
     },
     ask,
     log: (record) => telemetry?.log(record),
@@ -161,7 +179,9 @@ export default function piJev(pi: ExtensionAPI): void {
   /* ---------------------------------------------------------------------- */
 
   pi.on("session_start", async (_event, ctx) => {
+    enforcement.invalidate();
     currentCtx = ctx;
+    protectedPathsEnabled = true;
     try {
       config = loadConfig({
         cwd: ctx.cwd,
@@ -190,7 +210,10 @@ export default function piJev(pi: ExtensionAPI): void {
 
     try {
       const customPatterns = resolveCustomPatterns(config, ctx.cwd);
-      redactor = createRedactor({ patterns: config.redaction.patterns, customPatterns });
+      const redactorOptions = { patterns: config.redaction.patterns, customPatterns };
+      redactor = createRedactor(redactorOptions);
+      previewRedactor = createRedactor({ ...redactorOptions, pathMode: "marked" });
+      localPreviewRedactor = createRedactor({ ...redactorOptions, pathMode: "preserve" });
     } catch (error) {
       state.layerEnabled = false;
       ctx.ui.notify(`pi-jev disabled: ${(error as Error).message}`, "error");
@@ -201,7 +224,7 @@ export default function piJev(pi: ExtensionAPI): void {
     telemetry = createTelemetry({ config, cwd: ctx.cwd });
     let providerKey: string | undefined;
     try {
-      providerKey = await ctx.modelRegistry.getApiKeyForProvider("typesafe");
+      providerKey = await ctx.modelRegistry.getApiKeyForProvider(config.apiKeyProvider);
     } catch {
       providerKey = undefined;
     }
@@ -241,10 +264,12 @@ export default function piJev(pi: ExtensionAPI): void {
   /* Module hooks                                                           */
   /* ---------------------------------------------------------------------- */
 
-  router.register(pi, deps);
-  gate.register(pi, deps);
+  // Register before router bookkeeping and the Jev gate; /jev off controls this guard too.
+  protectedPaths.register(pi, () => protectedPathsEnabled, enforcement);
+  const restoreRouterTools = router.register(pi, deps);
+  const observeGateEvidence = gate.register(pi, deps);
   watchdog.register(pi, deps);
-  registerToolResultPipeline(pi, deps);
+  registerToolResultPipeline(pi, deps, observeGateEvidence);
 
   /* ---------------------------------------------------------------------- */
   /* Commands (initial_plan.md §14)                                                      */
@@ -260,10 +285,11 @@ export default function piJev(pi: ExtensionAPI): void {
       }
       if (sub === "auth") {
         const ok = client?.hasApiKey === true;
+        const source = process.env[config.apiKeyEnv] ? config.apiKeyEnv : `/login ${config.apiKeyProvider}`;
         ctx.ui.notify(
           ok
-            ? `pi-jev auth: key available (${config.apiKeyEnv} or /login typesafe)`
-            : `pi-jev auth: no key — run /login typesafe or set ${config.apiKeyEnv}`,
+            ? `pi-jev auth: ${config.apiKeyProvider} key available (from ${source})`
+            : `pi-jev auth: no ${config.apiKeyProvider} key — run /login ${config.apiKeyProvider} or set ${config.apiKeyEnv}`,
           "info",
         );
         return;
@@ -278,13 +304,18 @@ export default function piJev(pi: ExtensionAPI): void {
         return;
       }
       if (sub === "off") {
+        enforcement.invalidate();
         state.layerEnabled = false;
+        protectedPathsEnabled = false;
+        restoreRouterTools();
         deps.status(formatStatus(state, config));
         ctx.ui.notify("pi-jev disabled for this session.", "info");
         return;
       }
       if (sub === "on") {
+        enforcement.invalidate();
         state.layerEnabled = true;
+        protectedPathsEnabled = true;
         deps.status(formatStatus(state, config));
         ctx.ui.notify("pi-jev enabled for this session.", "info");
         return;
@@ -370,12 +401,46 @@ export default function piJev(pi: ExtensionAPI): void {
 /* Shared tool_result pipeline: shield + prune, one request (initial_plan.md §5.4)         */
 /* -------------------------------------------------------------------------- */
 
-function registerToolResultPipeline(pi: ExtensionAPI, deps: Deps): void {
+function textOnlyResult(content: ToolResultEvent["content"]): string | undefined {
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block.type !== "text") return undefined;
+    parts.push(block.text);
+  }
+  return parts.join("\n");
+}
+
+function notifyGateEvidence(
+  observer: gate.GateEvidenceObserver,
+  event: ToolResultEvent,
+  content: ToolResultEvent["content"] | undefined,
+): void {
+  const result: gate.GateEvidenceResult = {
+    toolCallId: event.toolCallId,
+    toolName: event.toolName,
+    isError: event.isError,
+  };
+  if (!event.isError && content) {
+    const text = textOnlyResult(content);
+    if (text !== undefined) result.text = text;
+  }
+  try {
+    observer(result);
+  } catch {
+    // Evidence capture failure must not alter the tool result; retry falls back to ask.
+  }
+}
+
+function registerToolResultPipeline(pi: ExtensionAPI, deps: Deps, observeGateEvidence: gate.GateEvidenceObserver): void {
+  const failureFingerprints = new Map<string, true>();
+  pi.on("session_start", () => failureFingerprints.clear());
+
   pi.on("tool_result", async (event, ctx) => {
     const { state, config } = deps;
     const shieldEnabled = config.modules.shield.enabled;
     const pruneEnabled = config.modules.prune.enabled;
     if (!state.layerEnabled || (!shieldEnabled && !pruneEnabled)) return;
+    const scope = deps.enforcement.capture();
 
     const raw = shield.resultText(event.content);
     const sampled = shield.sampleToolOutput(raw);
@@ -388,7 +453,9 @@ function registerToolResultPipeline(pi: ExtensionAPI, deps: Deps): void {
 
     const result = await deps.ask("shield_prune", toolState, SHIELD_PRUNE_QUESTIONS, {
       signal: ctx.signal,
+      scope,
     });
+    if (result === ENFORCEMENT_CANCELLED || !deps.enforcement.isCurrent(scope)) return;
     const injectionFloor = config.modules.shield.deterministicInjection ? shield.deterministicInjection(raw) : 0;
     if (!result) {
       // Offline floor: classic injections are withheld even when Jev is
@@ -478,12 +545,21 @@ function registerToolResultPipeline(pi: ExtensionAPI, deps: Deps): void {
     if (!state.shadow.shield && shieldEnabled && shield.shieldHasMasking(shieldDecision)) {
       // maskContent keeps the original block shape (text redacted, non-text
       // passed through), so this is a same-shape, redacted copy of the input.
-      return { content: shield.maskContent(event.content, deps.redact) as typeof event.content };
+      const masked = shield.maskContent(event.content, deps.redact) as typeof event.content;
+      notifyGateEvidence(observeGateEvidence, event, masked);
+      return { content: masked };
     }
     if (!state.shadow.prune && pruneEnabled && pruneDecision.prune) {
       const redactedRaw = deps.redact(raw);
       const { notice } = prune.pruneOutput(redactedRaw, event.toolCallId);
       return { content: [{ type: "text" as const, text: notice }] };
+    }
+
+    if (shieldEnabled && !shieldDecision.replace) {
+      const evidenceContent = shield.shieldHasMasking(shieldDecision)
+        ? (shield.maskContent(event.content, deps.redact) as typeof event.content)
+        : event.content;
+      notifyGateEvidence(observeGateEvidence, event, evidenceContent);
     }
 
     // Speculative failure-type suggestion; cheap and occasionally saves a detour.
@@ -492,6 +568,20 @@ function registerToolResultPipeline(pi: ExtensionAPI, deps: Deps): void {
     const suggestion =
       pruneEnabled && !state.shadow.prune ? prune.failureSuggestion(result.answers) : null;
     if (suggestion) {
+      const fingerprint = hashState({
+        tool: event.toolName,
+        cwd: ctx.cwd,
+        inputHash: hashState(event.input),
+        outputHash: sha256Hex(shield.resultText(event.content, null)),
+        isError: event.isError,
+        suggestion,
+      });
+      if (failureFingerprints.has(fingerprint)) return;
+      failureFingerprints.set(fingerprint, true);
+      if (failureFingerprints.size > MAX_FAILURE_ADVISORIES) {
+        const oldest = failureFingerprints.keys().next().value;
+        if (oldest !== undefined) failureFingerprints.delete(oldest);
+      }
       pi.sendMessage(
         { customType: "jev-failure", content: suggestion, display: true },
         { deliverAs: "steer" },

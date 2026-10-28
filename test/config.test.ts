@@ -24,6 +24,7 @@ describe("config resolution", () => {
   it("returns built-in defaults when no file exists", () => {
     const config = loadConfig({ cwd: CWD, homeDir: HOME, env: {}, readFile: () => undefined });
     expect(config.model).toBe("jev-latest");
+    expect(config.apiKeyProvider).toBe("typesafe");
     expect(config.modules.router.shadow).toBe(true);
     expect(config.modules.gate.enabled).toBe(true);
     expect(config.modules.prune.enabled).toBe(false);
@@ -78,6 +79,71 @@ describe("config resolution", () => {
     expect(config.modules.router.enabled).toBe(false);
   });
 
+  it("honors low-confidence investigation mode only from a trusted project config", () => {
+    const projectPath = join(CWD, ".pi", "jev.json");
+    const optedIn = loadConfig({
+      cwd: CWD,
+      homeDir: HOME,
+      trusted: true,
+      env: {},
+      readFile: readFileMap({ [projectPath]: { modules: { gate: { lowConfidenceMode: "investigate-once" } } } }),
+    });
+    const untrusted = loadConfig({
+      cwd: CWD,
+      homeDir: HOME,
+      trusted: false,
+      env: {},
+      readFile: readFileMap({ [projectPath]: { modules: { gate: { lowConfidenceMode: "investigate-once" } } } }),
+    });
+
+    expect(optedIn.modules.gate.lowConfidenceMode).toBe("investigate-once");
+    expect(untrusted.modules.gate.lowConfidenceMode).toBe("ask");
+  });
+
+  it("ignores user-config and environment attempts to enable low-confidence investigation", () => {
+    const config = loadConfig({
+      cwd: CWD,
+      homeDir: HOME,
+      trusted: true,
+      env: { PI_JEV_GATE_LOW_CONFIDENCE_MODE: "investigate-once" },
+      readFile: readFileMap({
+        [join(HOME, ".pi", "agent", "jev.json")]: {
+          modules: { gate: { lowConfidenceMode: "investigate-once" } },
+        },
+      }),
+    });
+
+    expect(config.modules.gate.lowConfidenceMode).toBe("ask");
+  });
+
+  it("rejects an invalid trusted project low-confidence mode", () => {
+    expect(() =>
+      loadConfig({
+        cwd: CWD,
+        homeDir: HOME,
+        trusted: true,
+        env: {},
+        readFile: readFileMap({
+          [join(CWD, ".pi", "jev.json")]: { modules: { gate: { lowConfidenceMode: "retry-until-allowed" } } },
+        }),
+      }),
+    ).toThrow(/modules.gate.lowConfidenceMode/);
+  });
+
+  it("selects OpenRouter from environment with its required key env", () => {
+    const config = loadConfig({
+      cwd: CWD,
+      homeDir: HOME,
+      env: {
+        PI_JEV_API_KEY_PROVIDER: "openrouter",
+        PI_JEV_API_KEY_ENV: "OPENROUTER_API_KEY",
+      },
+      readFile: () => undefined,
+    });
+    expect(config.apiKeyProvider).toBe("openrouter");
+    expect(config.apiKeyEnv).toBe("OPENROUTER_API_KEY");
+  });
+
   it("PI_JEV_OFF disables every module", () => {
     const config = loadConfig({ cwd: CWD, homeDir: HOME, env: { PI_JEV_OFF: "1" }, readFile: () => undefined });
     expect(config.modules.router.enabled).toBe(false);
@@ -87,6 +153,23 @@ describe("config resolution", () => {
 });
 
 describe("config validation", () => {
+  it("rejects OpenRouter when the effective API key env conflicts", () => {
+    expect(() =>
+      loadConfig({
+        cwd: CWD,
+        homeDir: HOME,
+        trusted: true,
+        env: { PI_JEV_API_KEY_ENV: "TYPESAFE_API_KEY" },
+        readFile: readFileMap({
+          [join(HOME, ".pi", "agent", "jev.json")]: {
+            apiKeyProvider: "openrouter",
+            apiKeyEnv: "OPENROUTER_API_KEY",
+          },
+        }),
+      }),
+    ).toThrow('apiKeyProvider "openrouter" requires apiKeyEnv "OPENROUTER_API_KEY"');
+  });
+
   it("raises a clear ConfigError on invalid JSON", () => {
     expect(() =>
       loadConfig({

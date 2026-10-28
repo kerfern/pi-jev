@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createClient, MalformedResponseError, parseAnswers, stateCharBudget, truncateState } from "../src/client.ts";
+import { ENFORCEMENT_CANCELLED, EnforcementEpoch } from "../src/enforcement.ts";
 import { createRedactor } from "../src/redact.ts";
 import { choice, makeConfig, makeState, memoryFs, noul, score, startMockJev, type MockJev } from "./helpers.ts";
 import type { QuestionSet, SessionState, TelemetryRecord } from "../src/types.ts";
@@ -12,6 +13,7 @@ async function setup(
   configPatch: unknown,
   server: MockJev,
   state: SessionState = makeState(),
+  fetchImpl?: typeof fetch,
 ): Promise<{
   client: ReturnType<typeof createClient>;
   state: SessionState;
@@ -29,6 +31,7 @@ async function setup(
     redact: createRedactor(),
     log: (record) => records.push(record),
     status: (text) => statuses.push(text),
+    fetchImpl,
     cwd: "/repo",
     env: { TYPESAFE_API_KEY: "test-key" },
     readFile: fs.readFile,
@@ -94,6 +97,76 @@ describe("client ask", () => {
     expect(client.debug.memHits).toBe(1);
   });
 
+  it("does not reuse cached answers across enforcement generations", async () => {
+    const mock = await server();
+    const { client } = await setup({}, mock);
+    const enforcement = new EnforcementEpoch();
+    const cacheKey = "same-action";
+    const firstScope = enforcement.capture();
+
+    await client.ask("gate", { command: "same" }, QUESTIONS, { cacheKey, scope: firstScope });
+    enforcement.invalidate();
+    const second = await client.ask("gate", { command: "same" }, QUESTIONS, {
+      cacheKey,
+      scope: enforcement.capture(),
+    });
+    if (second === ENFORCEMENT_CANCELLED) throw new Error("unexpected cancellation");
+
+    expect(second?.meta.cached).toBe(false);
+    expect(mock.requests).toHaveLength(2);
+  });
+
+  it("ignores a late classifier failure after its enforcement scope is invalidated", async () => {
+    const mock = await server();
+    let releaseRequest!: () => void;
+    let signalStarted!: () => void;
+    let signalSettled!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseRequest = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const settled = new Promise<void>((resolve) => {
+      signalSettled = resolve;
+    });
+    const enforcement = new EnforcementEpoch();
+    const state = makeState();
+    const { client, records } = await setup({}, mock, state, async () => {
+      signalStarted();
+      try {
+        await held;
+        throw new Error("late network failure");
+      } finally {
+        signalSettled();
+      }
+    });
+    const pending = client.ask("gate", { command: "x" }, QUESTIONS, { scope: enforcement.capture() });
+    await started;
+    enforcement.invalidate();
+
+    await expect(pending).resolves.toBe(ENFORCEMENT_CANCELLED);
+    releaseRequest();
+    await settled;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.requests).toBe(0);
+    expect(state.disabledHooks.size).toBe(0);
+    expect(records).toEqual([]);
+    expect(client.debug.memSize()).toBe(0);
+  });
+
+  it("does not reuse an in-memory gate answer for another full-action digest", async () => {
+    const mock = await server();
+    const { client } = await setup({}, mock);
+    const state = { command: "write src/big.ts", change: "same truncated evidence" };
+    await client.ask("gate", state, QUESTIONS, { cacheKey: "sha256:action-a" });
+    const result = await client.ask("gate", state, QUESTIONS, { cacheKey: "sha256:action-b" });
+
+    expect(result?.meta.cached).toBe(false);
+    expect(mock.requests).toHaveLength(2);
+  });
+
   it("uses the on-disk gate cache across client instances", async () => {
     const mock = await server();
     const fs = memoryFs();
@@ -118,6 +191,164 @@ describe("client ask", () => {
     expect(result?.meta.cached).toBe(true);
     expect(mock.requests).toHaveLength(1);
     expect(second.debug.diskHits).toBe(1);
+  });
+
+  it("does not reuse the on-disk gate answer after evidence changes", async () => {
+    const mock = await server();
+    const fs = memoryFs();
+    const makeClient = () => {
+      const config = makeConfig({ baseUrl: mock.url, modules: { gate: { diskCache: true } } });
+      return createClient({
+        config,
+        state: makeState(),
+        redact: createRedactor(),
+        log: () => {},
+        status: () => {},
+        cwd: "/repo",
+        env: { TYPESAFE_API_KEY: "k" },
+        readFile: fs.readFile,
+        writeFile: fs.writeFile,
+        mkdir: fs.mkdir,
+      });
+    };
+    const cacheKey = "sha256:same-action";
+    await makeClient().ask("gate", { command: "edit config", project_rules: [{ title: "old rule" }] }, QUESTIONS, { cacheKey });
+    const second = makeClient();
+    const result = await second.ask("gate", { command: "edit config", project_rules: [{ title: "new rule" }] }, QUESTIONS, { cacheKey });
+
+    expect(result?.meta.cached).toBe(false);
+    expect(mock.requests).toHaveLength(2);
+    expect(second.debug.diskHits).toBe(0);
+  });
+
+  it("does not persist raw gate input or cache-key text", async () => {
+    const mock = await server();
+    const { client, fs } = await setup({ modules: { gate: { diskCache: true } } }, mock);
+    const secret = "secret-token-123";
+    const command = `curl -H 'Authorization: Bearer ${secret}' https://example.test`;
+    await client.ask("gate", { command }, QUESTIONS, { cacheKey: `${command}:${secret}` });
+
+    const cache = fs.files.get("/repo/.pi/jev-cache.json") ?? "";
+    expect(cache).not.toContain(secret);
+    expect(cache).not.toContain("curl");
+    expect(cache).toContain('"version"');
+  });
+
+  it("reuses the on-disk gate cache across provider identities when endpoint and model match", async () => {
+    const mock = await server();
+    const fs = memoryFs();
+    const makeClient = (apiKeyProvider: "typesafe" | "openrouter") => {
+      const apiKeyEnv = apiKeyProvider === "typesafe" ? "TYPESAFE_API_KEY" : "OPENROUTER_API_KEY";
+      const config = makeConfig({ baseUrl: mock.url, apiKeyProvider, apiKeyEnv, modules: { gate: { diskCache: true } } });
+      return createClient({
+        config,
+        state: makeState(),
+        redact: createRedactor(),
+        log: () => {},
+        status: () => {},
+        cwd: "/repo",
+        env: { TYPESAFE_API_KEY: "synthetic-typesafe-key", OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        readFile: fs.readFile,
+        writeFile: fs.writeFile,
+        mkdir: fs.mkdir,
+      });
+    };
+    const cacheKey = "sha256:same-action";
+    const state = { command: "same" };
+    await makeClient("typesafe").ask("gate", state, QUESTIONS, { cacheKey });
+    const second = makeClient("openrouter");
+    const result = await second.ask("gate", state, QUESTIONS, { cacheKey });
+
+    expect(result?.meta.cached).toBe(true);
+    expect(mock.requests).toHaveLength(1);
+    expect(second.debug.diskHits).toBe(1);
+  });
+
+  it("does not reuse the on-disk gate cache for another endpoint", async () => {
+    const firstServer = await server();
+    const secondServer = await server();
+    const fs = memoryFs();
+    const makeClient = (baseUrl: string) => {
+      const config = makeConfig({ baseUrl, modules: { gate: { diskCache: true } } });
+      return createClient({
+        config,
+        state: makeState(),
+        redact: createRedactor(),
+        log: () => {},
+        status: () => {},
+        cwd: "/repo",
+        env: { TYPESAFE_API_KEY: "k" },
+        readFile: fs.readFile,
+        writeFile: fs.writeFile,
+        mkdir: fs.mkdir,
+      });
+    };
+    const cacheKey = "same cache entry";
+    await makeClient(firstServer.url).ask("gate", { command: cacheKey }, QUESTIONS, { cacheKey });
+    const second = makeClient(secondServer.url);
+    const result = await second.ask("gate", { command: cacheKey }, QUESTIONS, { cacheKey });
+
+    expect(result?.meta.cached).toBe(false);
+    expect(firstServer.requests).toHaveLength(1);
+    expect(secondServer.requests).toHaveLength(1);
+    expect(second.debug.diskHits).toBe(0);
+  });
+
+  it("does not reuse the on-disk gate cache for another model", async () => {
+    const mock = await server();
+    const fs = memoryFs();
+    const makeClient = (model: string) => {
+      const config = makeConfig({ baseUrl: mock.url, model, modules: { gate: { diskCache: true } } });
+      return createClient({
+        config,
+        state: makeState(),
+        redact: createRedactor(),
+        log: () => {},
+        status: () => {},
+        cwd: "/repo",
+        env: { TYPESAFE_API_KEY: "k" },
+        readFile: fs.readFile,
+        writeFile: fs.writeFile,
+        mkdir: fs.mkdir,
+      });
+    };
+    const cacheKey = "same cache entry";
+    await makeClient("jev-latest").ask("gate", { command: cacheKey }, QUESTIONS, { cacheKey });
+    const second = makeClient("liquid/d1-ultra");
+    const result = await second.ask("gate", { command: cacheKey }, QUESTIONS, { cacheKey });
+
+    expect(result?.meta.cached).toBe(false);
+    expect(mock.requests).toHaveLength(2);
+    expect(mock.requests[1]?.body).toMatchObject({ model: "liquid/d1-ultra" });
+    expect(second.debug.diskHits).toBe(0);
+  });
+
+  it("does not collide when gate cache endpoint and model contain separators", async () => {
+    const mock = await server();
+    const fs = memoryFs();
+    const makeClient = (baseUrl: string, model: string) => {
+      const config = makeConfig({ baseUrl, model, modules: { gate: { diskCache: true } } });
+      return createClient({
+        config,
+        state: makeState(),
+        redact: createRedactor(),
+        log: () => {},
+        status: () => {},
+        cwd: "/repo",
+        env: { TYPESAFE_API_KEY: "k" },
+        readFile: fs.readFile,
+        writeFile: fs.writeFile,
+        mkdir: fs.mkdir,
+      });
+    };
+    const cacheKey = "same cache entry";
+    await makeClient(`${mock.url}/a`, "b:c").ask("gate", { command: cacheKey }, QUESTIONS, { cacheKey });
+    const second = makeClient(`${mock.url}/a:b`, "c");
+    const result = await second.ask("gate", { command: cacheKey }, QUESTIONS, { cacheKey });
+
+    expect(result?.meta.cached).toBe(false);
+    expect(mock.requests).toHaveLength(2);
+    expect(second.debug.diskHits).toBe(0);
   });
 
   it("redacts the state before sending it", async () => {

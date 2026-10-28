@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import type {
   Config,
   GateConfig,
+  GateLowConfidenceMode,
   ModulesConfig,
   PruneConfig,
   RouterConfig,
@@ -121,6 +122,7 @@ function defaultGate(): GateConfig {
     onFailure: "allow",
     withoutUi: "deny",
     confirmMode: "ask",
+    lowConfidenceMode: "ask",
     // Obvious cases (force push, recursive rm, DROP) are decided in code, so
     // the gate works offline and does not pay Jev to recognize them.
     fastPath: { enabled: true, block: false },
@@ -190,6 +192,7 @@ function defaultWatchdog(): WatchdogConfig {
 
 export function defaultConfig(): Config {
   return {
+    apiKeyProvider: "typesafe",
     apiKeyEnv: "TYPESAFE_API_KEY",
     model: "jev-latest",
     baseUrl: "https://api.typesafe.ai",
@@ -290,6 +293,18 @@ function parseJsonFile(read: (path: string) => string | undefined, path: string)
   }
 }
 
+function trustedProjectLowConfidenceMode(value: unknown): GateLowConfidenceMode {
+  if (!isPlainObject(value)) return "ask";
+  const modules = value.modules;
+  if (!isPlainObject(modules)) return "ask";
+  const gate = modules.gate;
+  if (!isPlainObject(gate) || gate.lowConfidenceMode === undefined) return "ask";
+  if (gate.lowConfidenceMode === "ask" || gate.lowConfidenceMode === "investigate-once") {
+    return gate.lowConfidenceMode;
+  }
+  throw new ConfigError('modules.gate.lowConfidenceMode must be "ask" or "investigate-once"');
+}
+
 function envBool(value: string | undefined): boolean | undefined {
   if (value === undefined) return undefined;
   if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
@@ -308,6 +323,12 @@ function applyEnv(config: Config, env: NodeJS.ProcessEnv): Config {
   const next = config;
   if (env.PI_JEV_MODEL) next.model = env.PI_JEV_MODEL;
   if (env.PI_JEV_BASE_URL) next.baseUrl = env.PI_JEV_BASE_URL;
+  if (env.PI_JEV_API_KEY_PROVIDER !== undefined) {
+    if (env.PI_JEV_API_KEY_PROVIDER !== "typesafe" && env.PI_JEV_API_KEY_PROVIDER !== "openrouter") {
+      throw new ConfigError('PI_JEV_API_KEY_PROVIDER must be "typesafe" or "openrouter"');
+    }
+    next.apiKeyProvider = env.PI_JEV_API_KEY_PROVIDER;
+  }
   if (env.PI_JEV_API_KEY_ENV) next.apiKeyEnv = env.PI_JEV_API_KEY_ENV;
   if (env.PI_JEV_LOG_DIR) next.telemetry.dir = env.PI_JEV_LOG_DIR;
   const logStateContent = envBool(env.PI_JEV_LOG_STATE_CONTENT);
@@ -360,10 +381,10 @@ export function loadConfig(options: LoadConfigOptions): Config {
   const projectPath = join(options.cwd, options.configDirName ?? ".pi", "jev.json");
 
   config = deepMerge(config, parseJsonFile(read, userPath));
-  if (options.trusted) {
-    config = deepMerge(config, parseJsonFile(read, projectPath));
-  }
+  const projectConfig = options.trusted ? parseJsonFile(read, projectPath) : undefined;
+  if (options.trusted) config = deepMerge(config, projectConfig);
   config = applyEnv(config, env);
+  config.modules.gate.lowConfidenceMode = trustedProjectLowConfidenceMode(projectConfig);
 
   validateConfig(config);
   return config;
@@ -451,6 +472,9 @@ function validateGate(gate: GateConfig): void {
   if (!["ask", "steer"].includes(gate.confirmMode)) {
     throw new ConfigError('modules.gate.confirmMode must be "ask" or "steer"');
   }
+  if (!["ask", "investigate-once"].includes(gate.lowConfidenceMode)) {
+    throw new ConfigError('modules.gate.lowConfidenceMode must be "ask" or "investigate-once"');
+  }
   bool(gate.fastPath.enabled, "modules.gate.fastPath.enabled");
   bool(gate.fastPath.block, "modules.gate.fastPath.block");
   bool(gate.rules.enabled, "modules.gate.rules.enabled");
@@ -514,6 +538,12 @@ function validateWatchdog(watchdog: WatchdogConfig): void {
 }
 
 export function validateConfig(config: Config): void {
+  if (!["typesafe", "openrouter"].includes(config.apiKeyProvider)) {
+    throw new ConfigError('apiKeyProvider must be "typesafe" or "openrouter"');
+  }
+  if (config.apiKeyProvider === "openrouter" && config.apiKeyEnv !== "OPENROUTER_API_KEY") {
+    throw new ConfigError('apiKeyProvider "openrouter" requires apiKeyEnv "OPENROUTER_API_KEY"');
+  }
   nonEmptyString(config.apiKeyEnv, "apiKeyEnv");
   nonEmptyString(config.model, "model");
   nonEmptyString(config.baseUrl, "baseUrl");

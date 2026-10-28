@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   confirmMessage,
   decideGate,
+  describeChange,
   describeToolInput,
   enforceBlockPolicy,
   escalateForRules,
@@ -132,8 +133,8 @@ describe("deterministic fast path", () => {
     expect(matchFastPath("npm run build", true)).toBeUndefined();
   });
 
-  it("degrades a destructive hit to confirm when block is disabled", () => {
-    expect(matchFastPath("rm -rf /", false)?.outcome).toBe("confirm");
+  it("degrades a destructive hit to confirmation-required when block is disabled", () => {
+    expect(matchFastPath("rm -rf /", false)).toMatchObject({ outcome: "confirm", blockDowngraded: true });
   });
 });
 
@@ -181,21 +182,27 @@ describe("project rules", () => {
     expect(violations[0]?.title).toBe("No console statements");
   });
 
-  it("escalates to a steer, and never downgrades a block", () => {
+  it("escalates to a steer without erasing a downgraded block's confirmation requirement", () => {
     const config = { enabled: true, files: [], maxRules: 10, violationThreshold: 0.6, onViolation: "steer" as const };
     const violations = [{ index: 0, title: "R", probability: 0.9 }];
     const allow = { outcome: "allow" as const, rule: 7, reason: "ok", numbers: {} };
     expect(escalateForRules(allow, violations, config)).toMatchObject({ outcome: "confirm", steer: true });
     const block = { outcome: "block" as const, rule: 1, reason: "no", numbers: {} };
     expect(escalateForRules(block, violations, config).outcome).toBe("block");
+    const downgraded = enforceBlockPolicy(block, false);
+    expect(escalateForRules(downgraded, violations, config)).toMatchObject({
+      outcome: "confirm",
+      steer: true,
+      blockDowngraded: true,
+    });
     expect(escalateForRules(allow, violations, { ...config, onViolation: "block" }).outcome).toBe("block");
   });
 });
 
 describe("block policy", () => {
-  it("downgrades a disabled block to confirm rather than allow", () => {
+  it("marks a disabled block as confirmation-required", () => {
     const decision = { outcome: "block" as const, rule: 1, reason: "x", numbers: {} };
-    expect(enforceBlockPolicy(decision, false).outcome).toBe("confirm");
+    expect(enforceBlockPolicy(decision, false)).toMatchObject({ outcome: "confirm", blockDowngraded: true });
     expect(enforceBlockPolicy(decision, true).outcome).toBe("block");
   });
 });
@@ -242,20 +249,58 @@ describe("pre-flight skips", () => {
 });
 
 describe("gate disk-cache key", () => {
-  it("is stable for identical input", () => {
-    expect(gateCacheKey("chmod 755 file", "fix perms", "repo")).toBe(
-      gateCacheKey("chmod 755 file", "fix perms", "repo"),
-    );
+  const state = (command: string, userRequest: string, cwdBasename: string) => ({
+    tool: "bash",
+    command,
+    cwd_basename: cwdBasename,
+    user_request: userRequest,
+    recent_commands: [],
   });
 
-  it("separates numeric arguments, requests and repositories", () => {
-    const base = gateCacheKey("chmod 755 file", "fix perms", "repo");
-    // The normalised key alone collapsed these; the digest must not.
-    expect(gateCacheKey("chmod 000 file", "fix perms", "repo")).not.toBe(base);
+  it("is stable without exposing raw command or request text", () => {
+    const command = "curl -H 'Authorization: Bearer secret-token-123' https://example.test";
+    const gateState = state(command, "send secret-token-123", "repo");
+    const key = gateCacheKey("bash", { command }, gateState, "/Users/alice/repo");
+
+    expect(key).toBe(gateCacheKey("bash", { command }, gateState, "/Users/alice/repo"));
+    expect(key).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(key).not.toContain("secret-token-123");
+    expect(key).not.toContain("curl");
+  });
+
+  it("separates exact arguments, requests and full working directories", () => {
+    const command = "chmod 755 file";
+    const base = gateCacheKey("bash", { command }, state(command, "fix perms", "repo"), "/work/a/repo");
+    // The normalised key alone collapses these; the digest must not.
+    expect(
+      gateCacheKey("bash", { command: "chmod 000 file" }, state("chmod 000 file", "fix perms", "repo"), "/work/a/repo"),
+    ).not.toBe(base);
     // matches_intent is derived from the request, so the request must be keyed.
-    expect(gateCacheKey("chmod 755 file", "a different request", "repo")).not.toBe(base);
-    // A decision must not leak across repositories.
-    expect(gateCacheKey("chmod 755 file", "fix perms", "other-repo")).not.toBe(base);
+    expect(gateCacheKey("bash", { command }, state(command, "a different request", "repo"), "/work/a/repo")).not.toBe(base);
+    // Same basename in a different directory is a different scope.
+    expect(gateCacheKey("bash", { command }, state(command, "fix perms", "repo"), "/work/b/repo")).not.toBe(base);
+  });
+
+  it("distinguishes tool inputs beyond both display truncation limits", () => {
+    const prefix = "x".repeat(9_000);
+    const firstInput = { path: "src/big.ts", content: `${prefix}first` };
+    const secondInput = { path: "src/big.ts", content: `${prefix}second` };
+    const makeState = (input: typeof firstInput) => ({
+      tool: "write",
+      command: describeToolInput("write", input),
+      cwd_basename: "repo",
+      user_request: "update file",
+      recent_commands: [],
+      change: describeChange(input),
+    });
+    const firstState = makeState(firstInput);
+    const secondState = makeState(secondInput);
+
+    expect(firstState.command).toBe(secondState.command);
+    expect(firstState.change).toBe(secondState.change);
+    expect(gateCacheKey("write", firstInput, firstState, "/work/repo")).not.toBe(
+      gateCacheKey("write", secondInput, secondState, "/work/repo"),
+    );
   });
 });
 
@@ -285,5 +330,20 @@ describe("confirm message", () => {
     expect(message).toContain("blast radius 3.2/3");
     expect(message).toContain("git push --force origin main");
     expect(message).toContain("Allow?");
+  });
+
+  it("shows the complete multiline action preview", () => {
+    const decision = { outcome: "confirm" as const, rule: 0, reason: "review", numbers: {} };
+    const message = confirmMessage(decision, "bash\nprintf safe\nrm -rf /tmp/data");
+    expect(message).toContain("Action preview (redacted):");
+    expect(message).toContain("printf safe");
+    expect(message).toContain("rm -rf /tmp/data");
+  });
+
+  it("marks previews truncated when they exceed the display limit", () => {
+    const decision = { outcome: "confirm" as const, rule: 0, reason: "review", numbers: {} };
+    const message = confirmMessage(decision, `edit src/a.ts\n${"x".repeat(2_500)}\nTAIL_MARKER`);
+    expect(message).toContain("preview truncated");
+    expect(message).not.toContain("TAIL_MARKER");
   });
 });

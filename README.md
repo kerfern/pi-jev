@@ -1,16 +1,16 @@
 # pi-jev
 
 A typed classification layer for the [Pi coding agent](https://pi.dev), backed by
-[TypeSafe](https://typesafe.ai)'s `jev-latest` System One model.
+a configurable System One endpoint (TypeSafe by default; OpenRouter also supported).
 
 Coding agents make dozens of implicit decisions per session that nobody classifies:
-which model tier a prompt deserves, whether a shell command is recoverable, whether
+which model tier a prompt deserves, whether a file operation is reversible, whether
 a 4,000-line build log is worth a place in the context window, whether the agent is
 still working on what was asked. `pi-jev` turns each of those into an explicit Jev
 question with a calibrated probability, a confidence value, and a threshold that is
 reviewable in one file.
 
-Five independently switchable modules, one request per hook, shadow mode by default.
+Five independently switchable modules, one request per hook, shadow mode by default. A session-scoped policy protects sensitive paths only through wrapped built-in `read`/`write`/`edit`; it does not sandbox shell, search, or opaque tools. `/jev off` disables the policy and invalidates pending Jev decisions.
 
 ## Status
 
@@ -23,13 +23,19 @@ Five independently switchable modules, one request per hook, shadow mode by defa
 | 4 | `prune` + `watchdog` | implemented, disabled by default |
 | 5 | release + measured numbers | fixtures measured; published on npm as `@riposta/pi-jev` (Trusted Publishing from GitHub Actions) and installable from git |
 
-Every module ships in **shadow mode**: it classifies, logs the counterfactual
-decision, and changes nothing until you promote it. See [Promoting a module](#promoting-a-module).
+Every Jev module ships in **shadow mode**: it classifies, logs the counterfactual
+decision, and makes no module enforcement changes until promoted. The direct-file
+protected-path policy is active by default; it covers wrapped built-in
+`read`/`write`/`edit` only and is disabled by `/jev off` for the session.
+See [Promoting a module](#promoting-a-module).
 
-Verified end-to-end against Pi `0.85.1`: `test/pi/run-e2e.mjs` drives a real `pi`
-session offline with a scripted model and asserts that the router classifies, a
-live gate blocks, a live shield withholds, and a `pi install`ed package
-auto-loads (see [Testing](#testing)).
+The repo's development SDK is `0.85.1`; the managed Pi runtime `1.4.0` has
+passed the local-mock E2E. These are distinct versions. `test/pi/run-e2e.mjs`
+drives real `pi` sessions offline with scripted models and asserts that the
+router preserves Pi's active tool selection, configured gate handling applies to
+shell calls, safe read/write/edit and `/jev off`/`on` flows work, a live shield
+withholds injected content, and a `pi install`ed package auto-loads. Dedicated
+unit tests cover protected direct-file targets (see [Testing](#testing)).
 
 ### Measured results (v0 fixtures, tuned defaults)
 
@@ -71,28 +77,28 @@ curl -fsSL https://pi.dev/install.sh | sh
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 ```
 
-Verify with `pi --version`. Pi also needs its own model provider — an API key
-(for example `ANTHROPIC_API_KEY`) or `/login` inside Pi. That is separate from
-the TypeSafe key `pi-jev` uses. See the [Pi docs](https://pi.dev/docs/latest).
+Verify with `pi --version`. Pi also needs a model provider — an API key (for
+example `ANTHROPIC_API_KEY`) or `/login` inside Pi. Jev auth is configured below;
+a Pi-stored key can be shared when both use the same provider. See the [Pi
+docs](https://pi.dev/docs/latest).
 
-### 2. Set the TypeSafe API key
+### 2. Configure Jev API auth
 
-`pi-jev` reads the key from the environment of the process that starts Pi:
-
-```bash
-export TYPESAFE_API_KEY=...
-```
-
-Or, instead of an env var, log in through Pi's provider system — the key is
-entered in a masked prompt and stored in Pi's auth store:
+By default, `pi-jev` uses TypeSafe. Set `TYPESAFE_API_KEY` or sign in through
+Pi's masked provider flow:
 
 ```
 /login typesafe
 ```
 
-The env var wins when present; the stored key is the fallback. Check the state
-with `/jev auth`. The variable name is configurable (`apiKeyEnv`), and there is
-no phone-home: the key is only used for requests to `api.typesafe.ai`.
+The configured environment variable wins; Pi-stored auth is the fallback. To
+use OpenRouter, configure `apiKeyProvider`, `apiKeyEnv`, `model`, and `baseUrl`
+together as shown in [OpenRouter configuration](#openrouter-configuration)
+below; provider selection alone leaves the TypeSafe endpoint and model active.
+Then sign in with `/login openrouter` or set `OPENROUTER_API_KEY`. Jev asks Pi
+only for the selected provider's key; it never falls back to another provider.
+`/jev auth` reports selected provider and whether auth comes from the environment
+or Pi.
 
 ### 3. Install pi-jev
 
@@ -122,11 +128,13 @@ pi install /absolute/path/to/pi-jev
 
 Update a published install later with `pi update npm:@riposta/pi-jev`.
 
-Every module starts in shadow mode, so installing it changes nothing until you
-promote one (see [Promoting a module](#promoting-a-module)).
+Every Jev module starts in shadow mode, so classification changes nothing until
+you promote one (see [Promoting a module](#promoting-a-module)). The protected-path
+guard takes effect as soon as the extension loads and is disabled by `/jev off` for the session.
 
-`pi-jev` sends metadata and sampled tool output to `api.typesafe.ai`. Read
-[Privacy](#privacy) before enabling it on a repository you care about.
+`pi-jev` sends metadata and sampled tool output to its configured Jev endpoint
+(TypeSafe by default; OpenRouter when selected). Read [Privacy](#privacy) before
+enabling it on a repository you care about.
 
 ## Commands
 
@@ -135,11 +143,11 @@ Everything lives under `/jev`. Run it with no arguments for the status summary.
 | Command | Scope | Does |
 | --- | --- | --- |
 | `/jev` | — | Status: the status line, active model and `QUESTIONS_VERSION`, each module's `off` / `shadow` / `live` state, and request/token/cost usage. An unknown subcommand prints the same summary. |
-| `/jev auth` | — | Shows whether a TypeSafe key is available and where it came from (env or `/login typesafe`). |
+| `/jev auth` | — | Shows whether the selected provider key is available and where it came from (env or `/login <provider>`). |
 | `/jev explain [hook]` | — | The most recent classification — overall, or for a specific `router`/`gate`/`shield`/`prune`/`watchdog`: every answer with its probability or score, the decision, the threshold/reason that fired, latency and token usage. |
 | `/jev shadow <module> on\|off` | session | Toggles shadow for one module: `router`, `gate`, `shield`, `prune` or `watchdog`. In shadow, the module classifies and logs but changes nothing (`[shadow]` + `wouldHaveBeen` in the log). |
-| `/jev off` | session | Whole-layer kill switch: every hook becomes a no-op until the session ends. |
-| `/jev on` | session | Re-enables the layer for the session. |
+| `/jev off` | session | Disables Jev modules and direct-file protection, cancels pending Jev decisions/prompts/path checks, and restores router-owned tool narrowing when Pi's active selection has not changed externally. Does not cancel native filesystem mutations already started. |
+| `/jev on` | session | Starts a fresh enforcement generation and re-enables Jev and direct-file protection for new calls; stale work from before the toggle remains canceled. |
 | `/jev stats [days]` | — | Reads `<telemetry.dir>/*.jsonl` for the last `days` (default `1`) and prints the decision mix, gate confirm labels (`allow`/`deny`/`unknown`) and cache hits. |
 | `/jev trace [n]` | — | Prints the last `n` decisions (default `5`), one line each. |
 | `/jev recommend` | — | Reads the gate labels from the log and suggests whether to relax the confirm thresholds. |
@@ -149,10 +157,13 @@ shows a live widget of the last eight decisions under the editor — the same
 one-liners `/jev trace` prints.
 
 `shadow` and `off`/`on` are **session-only**; they are not written to config. To
-make a change permanent, set `modules.<name>.shadow` (or `enabled`) in
+make a module change permanent, set `modules.<name>.shadow` (or `enabled`) in
 `~/.pi/agent/jev.json`, or `.pi/jev.json` in a trusted project. The status line
-shows `jev <tier> · <n> req · <cost|tokens>` and degrades to `jev off — <reason>`
-on failure.
+shows `jev <tier> · <n> req · <cost|tokens>` and can report `jev off — <reason>`
+when classification fails open; direct-file protection remains active in that state.
+`/jev off` is the explicit session kill switch for Jev decisions and direct-file
+protection; it invalidates pending work but does not interrupt native filesystem
+mutations already in progress. `/jev on` begins a fresh generation for new calls.
 
 ```text
 /jev                  # status + usage
@@ -161,16 +172,37 @@ on failure.
 /jev stats 7          # decision mix from the last week
 ```
 
+## Protected-path policy
+
+While Jev is active, wrapped built-in `read`, `write`, and `edit` reject
+`/Users/kerf/.ssh` and descendants, plus exact `.env` file basenames at any
+depth. `.env.local` and other `.env.*` names remain allowed; a directory named
+`.env` is not treated as an exact `.env` file. Checks cover path aliases through
+symlinks and recheck final arguments and actual filesystem-operation targets.
+Unresolvable safe targets retain Pi's native filesystem errors.
+
+This is **not a sandbox**. Other tools—including `bash`, `powershell`, `ls`,
+`grep`, `find`, and unknown/opaque tools—flow through to the existing Jev gate
+configuration; they are not categorically blocked by this path policy and can
+access protected paths if their configured handling allows it or gate is off.
+Human-entered `!` commands, other extensions/processes, hard-link aliases (not
+reliably detectable), and concurrent filesystem races are outside the boundary.
+
+`/jev off` invalidates pending Jev decisions and prompts, then disables the path
+policy for the session. A stale check is not revived by `/jev on`; new calls use
+a fresh generation. Native filesystem mutations already started are not
+canceled, so this extension-level guard does not replace OS permissions.
+
 ## How it works
 
 ```
 user prompt ─► router (before_agent_start) ─► model tier, thinking level, tool loadout
-                                              │
-agent loop ─┬─► gate (tool_call) ─────────────┤ allow / confirm / block
-            │                                 │
-            ├─► shield + prune (tool_result)  │ one shared request
-            │                                 │
-            └─► watchdog (turn_end, every N) ─┘ loop / false-completion advice
+
+read/write/edit ─► direct-file path guard ─┐
+other tool calls ──────────────────────────┴─► configured gate
+                                                (`/jev off` invalidates Jev work)
+tool_result ─► shield + prune (one shared request)
+turn_end ────► watchdog (every N) ─► loop / false-completion advice
 ```
 
 `index.ts` contains no decision logic. It loads config, builds the client,
@@ -186,11 +218,30 @@ A `QUESTIONS_VERSION` hash is computed from `questions.ts`; editing it invalidat
 the in-memory cache, the on-disk gate cache, and marks log records as a different
 generation so calibration never mixes generations.
 
+Disk gate cache stores classifier answers, not final decisions or user approvals;
+each hit is re-evaluated under current gate policy. New disk keys are opaque
+digests over full tool input plus gate context/cwd and endpoint, provider, model
+and question version. Existing `.pi/jev-cache.json` entries are left untouched; legacy keys
+may contain normalized command text.
+
 ## Configuration
 
 Resolution order: built-in defaults → `~/.pi/agent/jev.json` → `.pi/jev.json`
 (only when `ctx.isProjectTrusted()`) → environment overrides. An invalid file
 disables the extension with a clear message rather than falling back silently.
+
+### OpenRouter configuration
+
+For Liquid D1 Ultra through OpenRouter, configure:
+
+```json
+{
+  "model": "liquid/d1-ultra",
+  "baseUrl": "https://openrouter.ai/api",
+  "apiKeyProvider": "openrouter",
+  "apiKeyEnv": "OPENROUTER_API_KEY"
+}
+```
 
 A complete annotated example lives in [`examples/jev.json`](examples/jev.json).
 
@@ -209,7 +260,8 @@ Frequently changed values:
 }
 ```
 
-Environment overrides: `PI_JEV_MODEL`, `PI_JEV_BASE_URL`, `PI_JEV_API_KEY_ENV`,
+Environment overrides: `PI_JEV_MODEL`, `PI_JEV_BASE_URL`, `PI_JEV_API_KEY_PROVIDER`,
+`PI_JEV_API_KEY_ENV`,
 `PI_JEV_LOG_DIR`, `PI_JEV_LOG_STATE_CONTENT`, `PI_JEV_OFF`,
 `PI_JEV_<MODULE>_ENABLED`, `PI_JEV_<MODULE>_SHADOW`, `PI_JEV_<MODULE>_TIMEOUT_MS`,
 `PI_JEV_GATE_FASTPATH_ENABLED`, `PI_JEV_GATE_RULES_ENABLED`,
@@ -223,8 +275,9 @@ Timeouts are per request class and configurable
 `shield`+`prune` 3000 ms, `watchdog` 2000 ms. These are the calibrated defaults;
 the initial plan's original 800/400/1500/1000 ms measured below the real p50/p95 and made
 the hooks fail open (see [Calibration notes](#calibration-notes)). On expiry, a
-missing key, a `401`, or a budget breach the client returns `null` and the module
-fails **open** — Pi behaves exactly as if the extension were not installed.
+missing key, a `401`, or a budget breach the client returns `null` and the Jev
+module fails **open**. The protected-path guard remains active unless `/jev off`
+was issued in this session.
 
 - `401` disables the layer for the session.
 - `422` disables the offending request class and logs the question id (a bug in
@@ -247,7 +300,9 @@ When the gate is live and non-shadow, a classification failure falls back to
 
 `shield` and `prune` share **one** Jev request on `tool_result` and split the
 answers in code. That orchestration lives in `index.ts` so the two modules stay
-independent and the "one request per hook" rule holds.
+independent and the "one request per hook" rule holds. Exact-repeat
+`jev-failure` suggestions are suppressed among the latest 64 distinct
+fingerprints per session; changed evidence remains eligible.
 
 The router asks Pi for the models it can actually use
 (`modelRegistry.getAvailable()`) and sends that list to Jev, which picks one
@@ -255,18 +310,20 @@ directly; the configured `tiers` stay as the fallback when the list is empty or
 the answer is missing. A configured tier whose provider/model is not installed
 in Pi is reported once instead of failing silently.
 
-When the router judges a prompt read-only it narrows the loadout to `read`,
-`bash`, `ls`, `grep` and `find` — `bash` stays because shell is how read-only
-work gets done (`printenv`, `git log`, a test run), and the gate still
-classifies every shell command. The full loadout is restored on the next
-write-capable prompt. Set `modules.router.readOnlyThreshold` to `0` to disable
-the narrowing entirely.
+When the router judges a prompt read-only it intersects Pi's current tool
+selection with `read`, `bash`, `ls`, `grep` and `find`; it never adds tools Pi
+excluded at startup. A later write-capable prompt restores the router baseline.
+`/jev off` restores that baseline only if the active selection still matches
+Jev's last router-owned selection; an externally changed selection becomes the
+new baseline. Set `modules.router.readOnlyThreshold` to `0` to disable router
+narrowing (not direct-file protection).
 
-Deterministic checks run before any network call. The gate decides obvious
-commands locally (force push, recursive delete of `/`, `DROP`, `curl | sh`), so
-it protects a session with no API key and does not spend tokens recognizing
-them. The shield pattern-matches classic injection phrasing for the same
-reason. Jev is asked only for the judgment code cannot express.
+The path policy runs before Jev's gate for direct built-in `read`/`write`/`edit`
+only. Other enabled tools proceed to configured gate handling; shell/search tools
+are not sandboxed and may access protected paths. Gate fast-path and classifier
+settings still decide whether those calls pass, confirm, or block. The shield
+pattern-matches classic injection phrasing before a network request. Jev is
+asked only for judgments code cannot express.
 
 `gate.rules` optionally sends each `write`/`edit` plus your project Markdown
 rules (`AGENTS.md`, `CLAUDE.md`, `.pi/rules.md`, `pi-jev.md`) in the gate's
@@ -274,9 +331,29 @@ single request, one Noul per rule. A violated rule is fed back to the agent
 (`onViolation: "steer"`, the default) instead of interrupting you. Enable with
 `{"modules":{"gate":{"rules":{"enabled":true}}}}`.
 
-The gate's `confirmMode: "steer"` does the same for ordinary confirms: the
-concern goes back to the agent rather than to a prompt. Blocks and
-`withoutUi: "deny"` are unaffected.
+The gate's `confirmMode: "steer"` sends ordinary confirms for allowed file-tool
+calls back to the agent without a prompt. Keep `"ask"` when those still require
+user approval. Gate settings govern calls that reach the gate, including
+shell/search tools. Protected direct-file targets are denied before the gate and
+cannot be authorized by gate settings.
+Blocks and `withoutUi: "deny"` are unaffected. A block downgraded by
+`allowBlock: false`, or an unambiguously destructive fast-path entry downgraded
+by `fastPath.block: false`, still prompts with UI; neither can be steered away.
+Without UI, the configured `withoutUi` behavior still applies.
+
+The Rule 6 investigation pilot is opt-in only in a trusted project's `.pi/jev.json`:
+`modules.gate.lowConfidenceMode` defaults to `"ask"`; `"investigate-once"` is honored only from that project config (not user/global config or environment) and only when the gate is live. It blocks a low-confidence-only Rule 6 action, then permits one built-in `read` result that survives shield/prune. Jev re-evaluates the exact same action once with the redacted result capped at 4 KiB; the recheck treats it as untrusted evidence, not directions. Changed arguments discard evidence; missing, failed, withheld or pruned evidence and unresolved Rule 6 return to confirmation, or block when no UI is available. Rules 1–5 and defaults are unchanged. This adds up to 4 KiB of repository result text to a gate request; do not enable where repository content may not leave the machine. Pilot stays inactive unless separately enabled.
+
+A TUI `"ask"` dialog displays the action input after configured redaction:
+structured file-tool arguments, including write/edit content. It shows exact
+absolute paths for local review, which reveals local directory names. Secret
+and custom-pattern redaction still applies. Terminal control characters
+display as visible escapes (for example, `\u001b`); line breaks remain intact.
+RPC confirmations retain marked absolute prefixes and basenames because their
+messages are forwarded to the client. This changes confirmation display only;
+provider, cache, and log redaction stay unchanged. The preview is capped at
+2,000 characters and marks longer previews as truncated. Redaction is
+pattern-based; do not treat it as a guarantee that arbitrary secrets are removed.
 
 ### Promoting a module
 
@@ -319,10 +396,18 @@ touching the numbers (initial_plan.md §13.3). Nothing is blocked while `allowBl
 
 ## Privacy
 
-**What leaves the machine.** Prompts, shell commands, file paths, diff summaries
-and sampled tool output are sent to `api.typesafe.ai`. That is the whole point of
-the layer and it is not a footnote. Do not enable it where repository content may
+**What leaves the machine.** Prompts, file paths, write/edit content, diff
+summaries and sampled tool output are sent to the configured Jev `baseUrl`
+(TypeSafe by default; OpenRouter when selected). Shell/search calls are not blocked
+by the direct-file path policy; when gate classification runs, their command
+metadata may be sent to Jev. Human-entered `!` commands are outside this extension.
+This is not a no-egress boundary. Do not enable it where repository content may
 not leave.
+
+**Provider handling.** With OpenRouter, requests may be sent to a routed provider.
+Provider logging and retention policies vary; review [OpenRouter's current provider
+policies](https://openrouter.ai/docs/guides/privacy/provider-logging) and model
+provider terms. Do not assume zero retention or no training.
 
 **Redaction.** `src/redact.ts` runs deterministic, pattern-based scrubbing before
 any request leaves: credential shapes, bearer tokens, private key blocks,
@@ -340,44 +425,52 @@ disabled.
 
 **Controls.** Opt-in per project (`residency.enabled` + `residency.allowedRepos`),
 project trust for project-local config, hash-only telemetry by default
-(`logStateContent: false`), and a kill switch (`/jev off` or unset API key).
-`baseUrl` is configurable for a self-hosted proxy that terminates TLS and applies
-organisational redaction. It can also point at Vercel AI Gateway
+(`logStateContent: false`), and a session kill switch (`/jev off`) that disables
+Jev modules and the protected-path guard. An unset API key makes classification
+fail open but leaves the guard active. `baseUrl` is configurable for a self-hosted
+proxy that terminates TLS and applies organisational redaction. The API key is
+used only for requests to that endpoint.
+It can also point at Vercel AI Gateway
 (`model: "typesafe-ai/jev"`, a gateway `baseUrl`) where a zero-data-retention
 setting is available for the TypeSafe side of the traffic.
 
 ## Testing
 
 ```bash
-npm test          # 183 unit + integration tests, no network
+npm test          # full unit suite; no provider requests
 npm run typecheck
 npm run test:coverage
 npm run test:pi   # end-to-end against the real `pi` CLI (needs pi >= 0.85 on PATH)
 ```
 
-The client and the shell wiring are tested against a **real local HTTP server**
-speaking the TypeSafe wire shape (`test/helpers.ts`), not a stubbed `fetch`. That
-covers timeout, abort, `401`/`422`/`429`, cache hit/miss/versioning, disk cache,
-budget breach and redaction. Decision tables (including boundaries) are tested
-with stubbed answers. `test/index.test.ts` embeds a fake Pi harness and asserts
-real hook effects: model switched, tool call confirmed/blocked, result content
-replaced.
+The client and extension hook wiring are tested against a **real local HTTP
+server** speaking the TypeSafe wire shape (`test/helpers.ts`), not a stubbed
+`fetch`. That covers timeout, abort, `401`/`422`/`429`, cache
+hit/miss/versioning, disk cache, budget breach and redaction. Decision tables
+(including boundaries) are tested with stubbed answers. `test/index.test.ts`
+embeds a fake Pi harness and asserts real hook effects: model switched, tool
+calls confirmed/blocked, and result content replaced. `test/protected-paths.test.ts`
+checks the path policy, its `/jev off`/`on` toggle, and wrapped filesystem operations.
 
 ### End-to-end against real Pi
 
-`test/pi/run-e2e.mjs` runs the actual `pi` binary offline against local mocks —
-an OpenAI-compatible model server and a TypeSafe `/v1/systemone` server — with a
-scripted model. It verifies, three times:
+`test/pi/run-e2e.mjs` runs actual `pi` offline against local mocks — an
+OpenAI-compatible model server and a TypeSafe `/v1/systemone` server — with
+scripted models. It verifies:
 
-1. **dev load** (`pi -e ./src/index.ts`): router classifies the prompt, a live
-   `gate` blocks `git push --force` because there is no UI to confirm, and a live
-   `shield` replaces injected `read` output with the withheld notice.
+1. **dev load** (`pi -e ./src/index.ts`): router classifies the prompt, shell
+   calls reach configured gate handling, a live gate blocks a safe write when
+   no UI is available, and a live shield replaces injected `read` output with
+   the withheld notice.
 2. **package install** (`pi install /absolute/path/to/pi-jev`, then a normal run
    with no `-e`): the installed plugin auto-loads from settings and classifies.
-3. **interactive confirm** (`pi --mode rpc`): the harness answers the
-   `extension_ui_request` confirm dialog twice — deny then allow — and checks
-   that the gate blocks then allows, that the allowed command actually ran, and
-   that both `userChoice` labels land in the log.
+3. **RPC confirmation and file ops**: deny then allow a safe write, approve safe
+   edit, verify resulting file contents and recorded `userChoice` labels.
+4. **kill switch commands**: run `/jev off` and `/jev on` through Pi's RPC
+   extension-command path while safe reads continue.
+5. **tool selection and user shell**: a read-only router decision does not add
+   tools disabled by `--no-tools`; RPC bash exercises Pi's `user_bash` path, also
+   used by the human-entered `!` command, outside model-tool gate hooks.
 
 ```bash
 npm run test:pi

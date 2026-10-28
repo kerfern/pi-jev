@@ -24,6 +24,7 @@ import type {
   TierName,
   ThinkingLevel,
 } from "../types.ts";
+import { ENFORCEMENT_CANCELLED } from "../enforcement.ts";
 import { formatStatus } from "../telemetry.ts";
 import { messageText } from "../messages.ts";
 
@@ -35,13 +36,12 @@ export type RouterDecisionInput = Pick<
   "task_type" | "reasoning_needed" | "is_underspecified" | "needs_write_tools" | "touches_sensitive"
 >;
 
-/**
- * Loadout for work that is unlikely to write. It removes the direct mutators
- * (`write`, `edit`) but keeps `bash`: shell is how read-only tasks actually get
- * done (`printenv`, `git log`, a test run), and every shell command is still
- * classified by the gate. Stripping `bash` made "show me the env" impossible.
- */
+/** Router's read-only subset; each decision intersects it with Pi's current enabled tools. */
 export const READ_ONLY_TOOLS: readonly string[] = ["read", "bash", "ls", "grep", "find"];
+
+export function readOnlyToolsFrom(availableTools: readonly string[]): string[] {
+  return availableTools.filter((name) => READ_ONLY_TOOLS.includes(name));
+}
 
 /** Appended to the system prompt when the request is underspecified. */
 export const CLARIFY_DIRECTIVE =
@@ -341,17 +341,36 @@ export function resolveChosenSkill(
   return skills[Number(match[1])];
 }
 
-export function register(pi: ExtensionAPI, deps: Deps): void {
+export function register(pi: ExtensionAPI, deps: Deps): () => void {
   const recentFiles: string[] = [];
   let previousTurn = "";
   let warnedMissingModel = false;
-  // The full tool loadout captured before the router ever narrows it, so a
-  // later write-capable prompt can restore it. Without this the session stayed
-  // read-only after a single read-only classification.
-  let allTools: string[] | undefined;
+  let preRouterTools: string[] | undefined;
+  let lastRouterTools: string[] | undefined;
+
+  const sameToolSet = (left: readonly string[], right: readonly string[]): boolean =>
+    left.length === right.length && left.every((name) => right.includes(name));
+
+  const captureOrRebaseTools = (): string[] => {
+    const current = pi.getActiveTools();
+    if (!preRouterTools || !lastRouterTools || !sameToolSet(current, lastRouterTools)) {
+      preRouterTools = [...current];
+    }
+    return preRouterTools;
+  };
+
+  const restoreTools = (): void => {
+    if (!preRouterTools || !lastRouterTools) return;
+    const current = pi.getActiveTools();
+    if (sameToolSet(current, lastRouterTools)) pi.setActiveTools([...preRouterTools]);
+    else preRouterTools = [...current];
+    lastRouterTools = undefined;
+  };
 
   pi.on("session_start", () => {
-    allTools = undefined;
+    restoreTools();
+    preRouterTools = undefined;
+    lastRouterTools = undefined;
     warnedMissingModel = false;
   });
 
@@ -375,9 +394,9 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
 
   pi.on("before_agent_start", async (event, ctx) => {
     if (!deps.config.modules.router.enabled || !deps.state.layerEnabled) return;
+    const scope = deps.enforcement.capture();
 
-    // Capture the full loadout before any narrowing happens this session.
-    allTools ??= pi.getActiveTools();
+    captureOrRebaseTools();
 
     // Pi owns the list of usable models. Send the real list to Jev so the
     // classifier picks a model this machine actually has, instead of a tier
@@ -407,7 +426,8 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
       available_skills: skills.map((skill) => skill.name),
     };
 
-    const result = await deps.ask("router", state, questions, { signal: ctx.signal });
+    const result = await deps.ask("router", state, questions, { signal: ctx.signal, scope });
+    if (result === ENFORCEMENT_CANCELLED || !deps.enforcement.isCurrent(scope)) return;
     if (!result) {
       deps.log({
         hook: "router",
@@ -477,7 +497,16 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
       );
     }
 
-    const missing = await applyDecision(pi, ctx, decision, deps.config, allTools);
+    const missing = await applyDecision(
+      pi,
+      ctx,
+      decision,
+      deps.config,
+      captureOrRebaseTools,
+      () => deps.enforcement.isCurrent(scope),
+    );
+    if (!deps.enforcement.isCurrent(scope)) return;
+    lastRouterTools = pi.getActiveTools();
     if (missing && !warnedMissingModel) {
       warnedMissingModel = true;
       ctx.ui.notify(
@@ -491,6 +520,8 @@ export function register(pi: ExtensionAPI, deps: Deps): void {
     }
     return;
   });
+
+  return restoreTools;
 }
 
 /**
@@ -503,7 +534,8 @@ export async function applyDecision(
   ctx: ExtensionContext,
   decision: RouterDecision,
   config: Config,
-  fullTools?: readonly string[],
+  fullTools?: readonly string[] | (() => readonly string[]),
+  isCurrent?: () => boolean,
 ): Promise<string | undefined> {
   const target = decision.chosenModel ?? modelForTier(config, decision.tier);
   const model = ctx.modelRegistry.find(target.provider, target.model);
@@ -517,11 +549,13 @@ export async function applyDecision(
   } else {
     missing = `${target.provider}/${target.model}`;
   }
+  if (isCurrent && !isCurrent()) return missing;
   pi.setThinkingLevel(decision.thinking);
-  // Restore the captured loadout when this prompt is write-capable. Narrowing
-  // only (the previous behaviour) left the session stuck on read-only tools.
-  if (decision.readOnly) pi.setActiveTools([...READ_ONLY_TOOLS]);
-  else if (fullTools && fullTools.length > 0) pi.setActiveTools([...fullTools]);
+  // Narrow by intersection: router must never add tools absent from Pi's active set.
+  const availableTools =
+    typeof fullTools === "function" ? fullTools() : fullTools ?? pi.getActiveTools();
+  if (decision.readOnly) pi.setActiveTools(readOnlyToolsFrom(availableTools));
+  else if (fullTools) pi.setActiveTools([...availableTools]);
   return missing;
 }
 
