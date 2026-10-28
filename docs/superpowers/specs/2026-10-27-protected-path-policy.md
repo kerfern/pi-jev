@@ -1,6 +1,6 @@
 # Protected-path policy (revised)
 
-**Status:** Direction and written spec approved by user; implementation is present in the `v0.2.3`-based package change set. `npm run typecheck` and `PI_BIN=pi npm run test:all` passed (264 passed, 1 skipped; local-mock E2E). Independent review found no supported blockers. Commit/push pending under confirmed package-only scope.
+**Status:** Implementation committed locally as `545bc5a1dead34a95ba4f6358044b585133b0505` on `main`, based on `v0.2.3`. `npm run typecheck` and `PI_BIN=pi npm run test:all` passed (264 passed, 1 skipped; local-mock E2E); independent review found no supported blockers. This package `main` is the publish target; other repository source changes remain separate.
 
 This revision supersedes the earlier policy's blanket denial of shell/search/opaque tools and its rule that `/jev off` could not disable the path guard. Earlier approval of those stricter rules no longer applies.
 
