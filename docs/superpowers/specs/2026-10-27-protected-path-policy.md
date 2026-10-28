@@ -1,6 +1,14 @@
 # Protected-path policy (revised)
 
-**Status:** Implementation committed locally as `545bc5a1dead34a95ba4f6358044b585133b0505` on `main`, based on `v0.2.3`. `npm run typecheck` and `PI_BIN=pi npm run test:all` passed (264 passed, 1 skipped; local-mock E2E); independent review found no supported blockers. This package `main` is the publish target; other repository source changes remain separate.
+**Status:** Implementation and plan/spec closeout are committed locally as
+`545bc5a1dead34a95ba4f6358044b585133b0505` and
+`ef4bf97d1adf17ccee0a690e4c433f9b042760d6` on `main`, based on `v0.2.3`.
+Implementation-time checks `npm run typecheck` and `PI_BIN=pi npm run test:all`
+passed (264 passed, 1 skipped; local-mock E2E); independent review found no
+supported blockers. The
+published npm baseline remains `@riposta/pi-jev@0.2.3`; current local changes are
+not published (push denied with HTTP 403). Delivery is through an authorized
+patcher; other-repository source changes remain separate.
 
 This revision supersedes the earlier policy's blanket denial of shell/search/opaque tools and its rule that `/jev off` could not disable the path guard. Earlier approval of those stricter rules no longer applies.
 
@@ -51,7 +59,7 @@ No tool whitelist, shell parser, OS sandbox, new protected path, or configurable
 
 User approved advisor recommendation: allow already-enabled tools to flow through existing gate configuration without a categorical protected-path denial; retain `/Users/kerf/.ssh` and exact `.env` checks for wrapped `read`/`write`/`edit`; make `/jev off` invalidate pending Jev outcomes, including across off→on. Security trade-off was stated explicitly: shell/search/opaque tools can access protected paths, and Jev classification cannot guarantee otherwise.
 
-Written-spec review remains pending before implementation planning.
+> Historical draft note: written-spec review was pending before implementation planning. Review and implementation are now complete; current delivery status is recorded at the top of this file.
 
 ---
 

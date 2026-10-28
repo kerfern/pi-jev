@@ -21,7 +21,7 @@ Five independently switchable modules, one request per hook, shadow mode by defa
 | 2 | `gate` | implemented, shadow; `block` opt-in |
 | 3 | `shield` | implemented, shadow |
 | 4 | `prune` + `watchdog` | implemented, disabled by default |
-| 5 | release + measured numbers | fixtures measured; published on npm as `@riposta/pi-jev` (Trusted Publishing from GitHub Actions) and installable from git |
+| 5 | release + measured numbers | `@riposta/pi-jev@0.2.3` published; current protected-path/OpenRouter changes are local and unpublished |
 
 Every Jev module ships in **shadow mode**: it classifies, logs the counterfactual
 decision, and makes no module enforcement changes until promoted. The direct-file
@@ -220,9 +220,10 @@ generation so calibration never mixes generations.
 
 Disk gate cache stores classifier answers, not final decisions or user approvals;
 each hit is re-evaluated under current gate policy. New disk keys are opaque
-digests over full tool input plus gate context/cwd and endpoint, provider, model
-and question version. Existing `.pi/jev-cache.json` entries are left untouched; legacy keys
-may contain normalized command text.
+digests over normalized endpoint/model, question version, state hash/generation,
+and gate action identity (tool, full input, gate state, cwd). Provider identity and
+credentials are excluded. Existing `.pi/jev-cache.json` entries are left untouched;
+legacy keys may contain normalized command text.
 
 ## Configuration
 

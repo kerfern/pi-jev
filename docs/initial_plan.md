@@ -839,8 +839,11 @@ Each phase has an exit criterion. A phase is not done because the code compiles.
 
 `[updated]` Phases 0–4 are implemented and calibrated; the measured exit numbers
 are in [`../README.md`](../README.md) and [`calibration.md`](calibration.md).
-Phase 5 is done: `@riposta/pi-jev` is published on npm (Trusted Publishing from
-GitHub Actions, no long-lived token) and installable from git.
+Phase 5 is done for the published `@riposta/pi-jev@0.2.3` baseline (Trusted
+Publishing from GitHub Actions, no long-lived token) and installable from git.
+The protected-path/OpenRouter changes in the current local branch are not part of
+that release and remain unpublished; upstream delivery is through an authorized
+patcher.
 
 ### Phase 0 — Skeleton
 
