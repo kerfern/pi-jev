@@ -66,6 +66,8 @@ export function isRepoAllowed(cwd: string, allowed: readonly string[]): boolean 
 }
 
 export default function piJev(pi: ExtensionAPI): void {
+  const sessionOffMarker = "PI_JEV_SESSION_OFF";
+  const isSessionOff = () => process.env[sessionOffMarker] === "1";
   const enforcement = new EnforcementEpoch();
 
   // Register a "typesafe" provider so `pi /login typesafe` can store the Jev
@@ -96,7 +98,7 @@ export default function piJev(pi: ExtensionAPI): void {
   let previewRedactor: RedactFn = identityRedact;
   let localPreviewRedactor: RedactFn = identityRedact;
   let currentCtx: ExtensionContext | undefined;
-  // Fail-open startup/config states keep the guard; only /jev off disables it.
+  // Fail-open startup/config states keep the guard; explicit or inherited /jev off disables it.
   let protectedPathsEnabled = true;
   let configured = false;
 
@@ -181,7 +183,8 @@ export default function piJev(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     enforcement.invalidate();
     currentCtx = ctx;
-    protectedPathsEnabled = true;
+    protectedPathsEnabled = !isSessionOff();
+    if (isSessionOff()) state.layerEnabled = false;
     try {
       config = loadConfig({
         cwd: ctx.cwd,
@@ -245,6 +248,10 @@ export default function piJev(pi: ExtensionAPI): void {
     } else {
       state.layerEnabled = true;
     }
+    if (isSessionOff()) {
+      state.layerEnabled = false;
+      protectedPathsEnabled = false;
+    }
 
     if (!client.hasApiKey) {
       ctx.ui.notify(`pi-jev: ${config.apiKeyEnv} is not set; layer disabled (fail-open)`, "warning");
@@ -304,6 +311,7 @@ export default function piJev(pi: ExtensionAPI): void {
         return;
       }
       if (sub === "off") {
+        process.env[sessionOffMarker] = "1";
         enforcement.invalidate();
         state.layerEnabled = false;
         protectedPathsEnabled = false;
@@ -313,6 +321,7 @@ export default function piJev(pi: ExtensionAPI): void {
         return;
       }
       if (sub === "on") {
+        delete process.env[sessionOffMarker];
         enforcement.invalidate();
         state.layerEnabled = true;
         protectedPathsEnabled = true;

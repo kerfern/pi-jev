@@ -108,6 +108,7 @@ beforeEach(async () => {
   mock = await startMockJev();
   cwd = mkdtempSync(join(tmpdir(), "jev-index-"));
   vi.stubEnv("HOME", cwd);
+  vi.stubEnv("PI_JEV_SESSION_OFF", "");
   vi.stubEnv("TYPESAFE_API_KEY", "test-key");
   vi.stubEnv("PI_JEV_API_KEY_PROVIDER", "typesafe");
   vi.stubEnv("PI_JEV_API_KEY_ENV", "TYPESAFE_API_KEY");
@@ -463,6 +464,7 @@ describe("index wiring", () => {
     expect(ctx.ui.confirm).not.toHaveBeenCalled();
 
     await harness.commands.get("jev")!("on", ctx);
+    expect(process.env.PI_JEV_SESSION_OFF).toBeUndefined();
     expect((await callTool("bash")).some((entry) => entry?.block)).toBe(false);
     expect((await callTool("read", join(cwd, ".env"))).some((entry) => entry?.block)).toBe(true);
     await expect(
@@ -471,8 +473,39 @@ describe("index wiring", () => {
     expect(mock.requests).toHaveLength(before);
 
     await harness.commands.get("jev")!("off", ctx);
-    await emit(harness.handlers, "session_start", { type: "session_start", reason: "new session" }, ctx);
+    await emit(harness.handlers, "session_start", { type: "session_start", reason: "fork" }, ctx);
     expect((await callTool("bash")).some((entry) => entry?.block)).toBe(false);
+    expect((await callTool("read", join(cwd, ".env"))).some((entry) => entry?.block)).toBe(false);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("jev", "jev off");
+    expect(mock.requests).toHaveLength(before);
+  });
+
+  it("starts Jev off in a process inheriting the off marker", async () => {
+    vi.stubEnv("PI_JEV_SESSION_OFF", "1");
+    const { harness, ctx } = await boot();
+    writeFileSync(join(cwd, ".env"), "secret");
+    const readTool = harness.registeredTools.get("read");
+    expect(readTool).toBeDefined();
+
+    const result = await emit(
+      harness.handlers,
+      "tool_call",
+      {
+        type: "tool_call",
+        toolCallId: "inherited-off-read",
+        toolName: "read",
+        input: { path: join(cwd, ".env") },
+      },
+      ctx,
+    );
+    expect(result.some((entry) => entry?.block)).toBe(false);
+    await expect(
+      readTool.execute("inherited-off", { path: join(cwd, ".env") }, undefined, undefined, { cwd }),
+    ).resolves.toBeTruthy();
+    await emit(harness.handlers, "before_agent_start", { prompt: "add a feature", systemPrompt: "SYS" }, ctx);
+
+    expect(mock.requests).toHaveLength(0);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("jev", "jev off");
   });
 
   it("does not touch the model in router shadow mode", async () => {

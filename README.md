@@ -146,8 +146,8 @@ Everything lives under `/jev`. Run it with no arguments for the status summary.
 | `/jev auth` | — | Shows whether the selected provider key is available and where it came from (env or `/login <provider>`). |
 | `/jev explain [hook]` | — | The most recent classification — overall, or for a specific `router`/`gate`/`shield`/`prune`/`watchdog`: every answer with its probability or score, the decision, the threshold/reason that fired, latency and token usage. |
 | `/jev shadow <module> on\|off` | session | Toggles shadow for one module: `router`, `gate`, `shield`, `prune` or `watchdog`. In shadow, the module classifies and logs but changes nothing (`[shadow]` + `wouldHaveBeen` in the log). |
-| `/jev off` | session | Disables Jev modules and direct-file protection, cancels pending Jev decisions/prompts/path checks, and restores router-owned tool narrowing when Pi's active selection has not changed externally. Does not cancel native filesystem mutations already started. |
-| `/jev on` | session | Starts a fresh enforcement generation and re-enables Jev and direct-file protection for new calls; stale work from before the toggle remains canceled. |
+| `/jev off` | process + inheriting children | Disables Jev modules and direct-file protection, cancels pending Jev decisions/prompts/path checks, and restores router-owned tool narrowing when Pi's active selection has not changed externally. Applies to newly spawned Pi descendants that inherit the off marker; does not affect existing children or native filesystem mutations already started. |
+| `/jev on` | process | Clears this process's off marker and starts a fresh enforcement generation; future inheriting Pi descendants start with Jev enabled. Stale work from before the toggle remains canceled. |
 | `/jev stats [days]` | — | Reads `<telemetry.dir>/*.jsonl` for the last `days` (default `1`) and prints the decision mix, gate confirm labels (`allow`/`deny`/`unknown`) and cache hits. |
 | `/jev trace [n]` | — | Prints the last `n` decisions (default `5`), one line each. |
 | `/jev recommend` | — | Reads the gate labels from the log and suggests whether to relax the confirm thresholds. |
@@ -156,14 +156,18 @@ With `telemetry.traceWidget` (or `PI_JEV_TRACE_WIDGET=1`), the interactive UI
 shows a live widget of the last eight decisions under the editor — the same
 one-liners `/jev trace` prints.
 
-`shadow` and `off`/`on` are **session-only**; they are not written to config. To
-make a module change permanent, set `modules.<name>.shadow` (or `enabled`) in
-`~/.pi/agent/jev.json`, or `.pi/jev.json` in a trusted project. The status line
-shows `jev <tier> · <n> req · <cost|tokens>` and can report `jev off — <reason>`
+`shadow` is **session-only**. `/jev off` and `/jev on` control this Pi process;
+`off` also disables newly spawned Pi descendants that inherit its environment
+marker, while existing children are unchanged. These toggles are not written to
+config. To make a module change permanent, set `modules.<name>.shadow` (or
+`enabled`) in `~/.pi/agent/jev.json`, or `.pi/jev.json` in a trusted project.
+The status line shows `jev <tier> · <n> req · <cost|tokens>` and can report `jev off — <reason>`
 when classification fails open; direct-file protection remains active in that state.
-`/jev off` is the explicit session kill switch for Jev decisions and direct-file
+`/jev off` is the explicit process kill switch for Jev decisions and direct-file
 protection; it invalidates pending work but does not interrupt native filesystem
-mutations already in progress. `/jev on` begins a fresh generation for new calls.
+mutations already in progress. Newly spawned Pi descendants that inherit the
+marker also start off. `/jev on` clears the marker and begins a fresh generation
+for new calls; already-running child processes are unchanged.
 
 ```text
 /jev                  # status + usage
@@ -189,9 +193,11 @@ Human-entered `!` commands, other extensions/processes, hard-link aliases (not
 reliably detectable), and concurrent filesystem races are outside the boundary.
 
 `/jev off` invalidates pending Jev decisions and prompts, then disables the path
-policy for the session. A stale check is not revived by `/jev on`; new calls use
-a fresh generation. Native filesystem mutations already started are not
-canceled, so this extension-level guard does not replace OS permissions.
+policy for this process and newly spawned Pi descendants that inherit its
+marker. A stale check is not revived by `/jev on`; new calls use a fresh
+generation. Existing child processes and native filesystem mutations already
+started are not canceled, so this extension-level guard does not replace OS
+permissions.
 
 ## How it works
 
@@ -627,9 +633,10 @@ test/pi/        real-Pi end-to-end harness (mock model + mock Jev servers)
   are not.
 - No subagent/background-task triage: Pi's extension API (as of 0.85) does not
   expose subagent or background-task events, so there is no hook to judge
-  child-task reports. Runaway detection and the evidence-based done-check cover
-  the observable symptoms; a real subagent guard needs a Pi hook that does not
-  exist yet.
+  child-task reports. `/jev off` propagates to newly spawned Pi descendants that
+  inherit its marker, but cannot observe or control already-running children.
+  Runaway detection and the evidence-based done-check cover observable symptoms;
+  full subagent triage still needs a Pi hook that does not exist yet.
 
 ## Licence
 
