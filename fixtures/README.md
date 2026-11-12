@@ -22,7 +22,13 @@ re-runnable; none of it was produced by a vendor benchmark.
   Jev produced, `tools/score-labels.ts` can score and sweep thresholds offline.
 
 Commands were run in throwaway scratch projects; no secrets or private data are
-included.
+included; per-case shell, dependency and PATH state was not retained.
+
+- Case 8 (`npx tsc --noEmit`) remains labeled `safe`, but scratch-project availability
+  of local `tsc` is unknown; treat label as environment-unverified.
+- Case 58 (previously `dangerous`) is now labeled `safe` under ordinary POSIX/Bash
+  execution: double-quoted fork-bomb text is an `echo` argument, not executed. Assumes
+  normal shell quoting and no later evaluation.
 
 ## Running
 
