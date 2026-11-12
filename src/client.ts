@@ -326,6 +326,17 @@ export function createClient(deps: ClientDeps): Client {
       if (signal.aborted) controller.abort();
       else signal.addEventListener("abort", onAbort, { once: true });
     }
+    const waitForRequest = async <T>(promise: Promise<T>) => {
+      const result = await raceWithAbort(promise, controller.signal);
+      if (result !== ENFORCEMENT_CANCELLED) return result;
+      if (signal?.aborted) return ENFORCEMENT_CANCELLED;
+      if (timedOut) {
+        const wrapped = new Error("timeout") as Error & { kind: string };
+        wrapped.kind = "timeout";
+        throw wrapped;
+      }
+      return ENFORCEMENT_CANCELLED;
+    };
 
     const body = JSON.stringify({
       model: config.model,
@@ -364,9 +375,15 @@ export function createClient(deps: ClientDeps): Client {
         if (response.status === 429 || response.status === 529) {
           const retryAfter = Number(response.headers.get("retry-after")) * 1000;
           if (attempt < 2) {
-            // Drain the body so the retry does not leak the connection.
-            await response.body?.cancel().catch(() => undefined);
-            await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 2000) : 250 * 2 ** attempt);
+            // Keep retry cleanup and backoff within the request deadline.
+            const drain = response.body?.cancel().catch(() => undefined) ?? Promise.resolve();
+            const drained = await waitForRequest(drain);
+            if (drained === ENFORCEMENT_CANCELLED) return drained;
+            const delay = Number.isFinite(retryAfter) && retryAfter > 0
+              ? Math.min(retryAfter, 2000)
+              : 250 * 2 ** attempt;
+            const waited = await waitForRequest(sleep(delay));
+            if (waited === ENFORCEMENT_CANCELLED) return waited;
             continue;
           }
           const wrapped = new Error(`http ${response.status}`) as Error & { kind: string; status: number };
